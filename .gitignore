@@ -1,0 +1,4 @@
+.env
+secrets/ts_client_id
+secrets/ts_client_secret
+!secrets/.gitkeep
