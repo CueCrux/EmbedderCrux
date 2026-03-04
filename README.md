@@ -6,6 +6,8 @@ EmbedderCrux is a self-contained Docker appliance that turns any NVIDIA GPU into
 
 Built to power the embedding pipeline for [VaultCrux](https://vaultcrux.com), but useful for anyone who wants fast, private, provider-independent embeddings without sending data to a third-party API.
 
+The stack also publishes TEI locally (`127.0.0.1:8080` by default) so same-host services can keep embedding lanes healthy even if tailnet auth is not yet completed.
+
 ## Why This Exists
 
 Hosted embedding APIs are convenient, but they bill per token and can deprecate models with little notice. Running embeddings locally is usually faster and removes per-token costs, yet securely exposing a GPU endpoint to remote infrastructure is where most teams get stuck. EmbedderCrux solves that network problem by combining TEI with Tailscale mesh networking, so your GPU appears as a private internal service on your tailnet.
@@ -16,6 +18,8 @@ Hosted embedding APIs are convenient, but they bill per token and can deprecate 
 - NVIDIA Container Toolkit installed (`nvidia-ctk`)
 - Docker Engine + Docker Compose v2
 - Tailscale account (free tier works)
+- HashiCorp Vault access to a KVv2 path
+- `curl` + `jq` on the host (used by `scripts/compose-up-from-vault.sh`)
 
 ## Quick Start
 
@@ -30,13 +34,12 @@ Hosted embedding APIs are convenient, but they bill per token and can deprecate 
    - Define `tag:embedder` in your ACL `tagOwners` first.
    - Create an OAuth client scoped for tag-based node auth.
 
-3. Create local secret files:
+3. Write OAuth creds to Vault KV:
 
    ```bash
-   mkdir -p secrets
-   echo "your-client-id" > secrets/ts_client_id
-   echo "your-client-secret" > secrets/ts_client_secret
-   chmod 600 secrets/ts_client_id secrets/ts_client_secret
+   vault kv put kv/app/embeddercrux/prod \
+     ts_client_id="your-client-id" \
+     ts_client_secret="your-client-secret"
    ```
 
 4. Create your runtime config:
@@ -48,13 +51,19 @@ Hosted embedding APIs are convenient, but they bill per token and can deprecate 
 5. Start the appliance:
 
    ```bash
-   docker compose up -d
+   ./scripts/compose-up-from-vault.sh
    ```
+
+   The launcher starts GPU TEI first and only falls back to CPU TEI if GPU startup/health fails.
 
 6. Verify service health and embeddings:
 
    ```bash
    ./healthcheck.sh
+   curl http://localhost:8080/embed \
+     -X POST \
+     -H 'Content-Type: application/json' \
+     -d '{"inputs":["Hello world"]}'
    curl http://embedder:8080/embed \
      -X POST \
      -H 'Content-Type: application/json' \
@@ -67,10 +76,20 @@ Hosted embedding APIs are convenient, but they bill per token and can deprecate 
 | --- | --- | --- |
 | `TS_HOSTNAME` | Hostname shown for this node in Tailscale | `embedder` |
 | `TS_TAG` | ACL tag name used for `--advertise-tags=tag:<value>` | `embedder` |
+| `VAULT_ADDR` | Vault API address used by launcher script | `https://100.76.91.69:8200` |
+| `VAULT_SKIP_VERIFY` | Set `true` to skip TLS verification when using self-signed certs | `true` |
+| `VAULT_TOKEN_FILE` | File containing Vault token (used when `VAULT_TOKEN` is unset) | `${HOME}/.vault-token` |
+| `VAULT_SECRET_PATH` | KVv2 path containing `ts_client_id` and `ts_client_secret` | `kv/app/embeddercrux/prod` |
 | `MODEL_ID` | HuggingFace embedding model ID | `nomic-ai/nomic-embed-text-v1.5` |
-| `TEI_IMAGE_TAG` | TEI image variant for your GPU architecture | `89-1.9` |
+| `TEI_IMAGE_TAG` | GPU TEI image variant for your accelerator architecture | `cuda-1.9` |
+| `TEI_CPU_IMAGE_TAG` | CPU TEI image used only for fallback startup path | `cpu-1.9` |
+| `ALLOW_CPU_FALLBACK` | If `true`, launcher switches to CPU TEI when GPU health fails | `true` |
+| `TEI_HEALTH_TIMEOUT_SECONDS` | Health-check timeout before GPU is treated as failed startup | `300` |
 | `MAX_BATCH_TOKENS` | TEI max tokens per dynamic batch | `16384` |
+| `MAX_CLIENT_BATCH_SIZE` | Max input strings accepted per `/embed` request | `64` |
 | `MAX_CONCURRENT_REQUESTS` | TEI max in-flight requests | `512` |
+| `EMBEDDER_LOCAL_BIND` | Host/IP bind for optional local port publishing | `127.0.0.1` |
+| `EMBEDDER_HOST_PORT` | Host port mapped to TEI `:8080` | `8080` |
 
 ## Tailscale ACL Policy
 
@@ -98,13 +117,16 @@ With this policy, only nodes tagged `tag:infra` can reach `tag:embedder` on port
 
 | GPU Family | Examples | TEI Image Tag |
 | --- | --- | --- |
+| Broad CUDA default | Mixed/unknown modern NVIDIA fleets | `cuda-1.9` |
 | Ada Lovelace | RTX 4000 Ada, RTX 4090, L4 | `89-1.9` |
 | Ampere | A10G, A100, RTX 3090 | `86-1.9` (A10G / SM86) or `1.9` (A100 / SM80) |
 | Blackwell / Hopper | RTX PRO 6000, B100, H100 | `cuda-1.9` |
 | Turing | T4, RTX 2080 | `turing-1.9` |
 | CPU (testing) | Any | `cpu-1.9` |
 
-Compatibility note: older TEI examples often used `86-1.9` as the default for Ada and Ampere cards. This repo defaults to `89-1.9`; if your card needs SM86 builds, set `TEI_IMAGE_TAG=86-1.9` in `.env`.
+Compatibility note: older TEI examples often used `86-1.9` as the default for Ada and Ampere cards. This repo defaults to `cuda-1.9` for wider compatibility; if you want architecture-specific builds, set `TEI_IMAGE_TAG` explicitly (for example `89-1.9` or `86-1.9`).
+
+CPU fallback note: CPU TEI is profile-gated and only activated by the launcher fallback path (or by explicitly starting `tei-cpu`). When GPU startup succeeds, the launcher removes any stale CPU fallback container.
 
 ## Running Multiple Instances
 
@@ -112,9 +134,9 @@ Run another node by cloning a second copy (or a separate checkout), then changin
 
 - `TS_HOSTNAME` (must be unique)
 - `MODEL_ID` (optional, if you want a different embedding model)
-- secret files (`secrets/ts_client_id`, `secrets/ts_client_secret`) for that node identity
+- `VAULT_SECRET_PATH` (or credentials at that path) for that node identity
 
-Then launch as normal with `docker compose up -d`. Each instance joins the tailnet as a separate tagged node.
+Then launch as normal with `./scripts/compose-up-from-vault.sh`. Each instance joins the tailnet as a separate tagged node.
 
 ## Calling the Endpoint
 
@@ -166,8 +188,10 @@ print(f"received {len(vectors)} embeddings")
   - Run `nvidia-smi` on the host.
   - Confirm NVIDIA Container Toolkit is installed and configured.
   - Verify Docker can access GPU devices.
+  - If GPU startup still fails, launcher can temporarily fall back to `TEI_CPU_IMAGE_TAG` when `ALLOW_CPU_FALLBACK=true`.
 - **Tailscale not connecting**
-  - Confirm `secrets/ts_client_id` and `secrets/ts_client_secret` exist and are valid.
+  - Confirm Vault secret path contains valid `ts_client_id` and `ts_client_secret`.
+  - Confirm `VAULT_ADDR`, `VAULT_TOKEN`/`VAULT_TOKEN_FILE`, and `VAULT_SECRET_PATH` are correct.
   - Confirm `tag:embedder` exists in ACL `tagOwners`.
   - Check logs: `docker logs embedder-ts`.
 - **Slow first startup**

@@ -1,18 +1,39 @@
+x-tei-common: &tei-common
+  ports:
+    - "${EMBEDDER_LOCAL_BIND:-127.0.0.1}:${EMBEDDER_HOST_PORT:-8080}:8080"
+  volumes:
+    - tei-data:/data
+  environment:
+    - MODEL_ID=${MODEL_ID:-nomic-ai/nomic-embed-text-v1.5}
+    - MAX_BATCH_TOKENS=${MAX_BATCH_TOKENS:-16384}
+    - MAX_CLIENT_BATCH_SIZE=${MAX_CLIENT_BATCH_SIZE:-64}
+    - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-512}
+  command:
+    - --model-id
+    - ${MODEL_ID:-nomic-ai/nomic-embed-text-v1.5}
+    - --port
+    - "8080"
+    - --max-batch-tokens
+    - ${MAX_BATCH_TOKENS:-16384}
+    - --max-client-batch-size
+    - ${MAX_CLIENT_BATCH_SIZE:-64}
+    - --max-concurrent-requests
+    - ${MAX_CONCURRENT_REQUESTS:-512}
+  restart: unless-stopped
+
 services:
   tailscale:
     image: tailscale/tailscale:latest
     container_name: embedder-ts
     hostname: ${TS_HOSTNAME:-embedder}
     environment:
-      - TS_CLIENT_ID=file:/run/secrets/ts_client_id
-      - TS_CLIENT_SECRET=file:/run/secrets/ts_client_secret
+      - TS_CLIENT_ID=${TS_CLIENT_ID:?set TS_CLIENT_ID from Vault}
+      - TS_CLIENT_SECRET=${TS_CLIENT_SECRET:?set TS_CLIENT_SECRET from Vault}
       - TS_EXTRA_ARGS=--advertise-tags=tag:${TS_TAG:-embedder}
       - TS_HOSTNAME=${TS_HOSTNAME:-embedder}
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
     volumes:
-      - ./secrets/ts_client_id:/run/secrets/ts_client_id:ro
-      - ./secrets/ts_client_secret:/run/secrets/ts_client_secret:ro
       - ts-state:/var/lib/tailscale
     devices:
       - /dev/net/tun:/dev/net/tun
@@ -22,37 +43,17 @@ services:
     restart: unless-stopped
 
   tei:
-    image: ghcr.io/huggingface/text-embeddings-inference:${TEI_IMAGE_TAG:-89-1.9}
+    <<: *tei-common
+    image: ghcr.io/huggingface/text-embeddings-inference:${TEI_IMAGE_TAG:-cuda-1.9}
     container_name: embedder-tei
-    network_mode: service:tailscale
-    depends_on:
-      - tailscale
-    volumes:
-      - tei-data:/data
-    environment:
-      - MODEL_ID=${MODEL_ID:-nomic-ai/nomic-embed-text-v1.5}
-      - MAX_BATCH_TOKENS=${MAX_BATCH_TOKENS:-16384}
-      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-512}
-    entrypoint:
-      - text-embeddings-router
-    command:
-      - --model-id
-      - ${MODEL_ID:-nomic-ai/nomic-embed-text-v1.5}
-      - --port
-      - "8080"
-      - --max-batch-tokens
-      - ${MAX_BATCH_TOKENS:-16384}
-      - --max-concurrent-requests
-      - ${MAX_CONCURRENT_REQUESTS:-512}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities:
-                - gpu
-    restart: unless-stopped
+    gpus: all
+
+  tei-cpu:
+    <<: *tei-common
+    image: ghcr.io/huggingface/text-embeddings-inference:${TEI_CPU_IMAGE_TAG:-cpu-1.9}
+    container_name: embedder-tei-cpu
+    profiles:
+      - cpu-fallback
 
 volumes:
   ts-state:
