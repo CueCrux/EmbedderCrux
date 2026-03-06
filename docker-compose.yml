@@ -23,7 +23,7 @@ x-tei-common: &tei-common
 
 services:
   tailscale:
-    image: tailscale/tailscale:latest
+    image: tailscale/tailscale:v1.76.6
     container_name: embedder-ts
     hostname: ${TS_HOSTNAME:-embedder}
     environment:
