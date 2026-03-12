@@ -126,9 +126,16 @@ export class HealthChecker {
     const start = performance.now();
 
     try {
-      const res = await fetch(`${target.url}/healthz`, {
+      // Try /healthz first (gateway), fall back to /health (bare TEI)
+      let res = await fetch(`${target.url}/healthz`, {
         signal: AbortSignal.timeout(this.#timeoutMs),
-      });
+      }).catch(() => null);
+
+      if (!res || !res.ok) {
+        res = await fetch(`${target.url}/health`, {
+          signal: AbortSignal.timeout(this.#timeoutMs),
+        });
+      }
 
       const latency = performance.now() - start;
       node.latencyMs = Math.round(latency * 100) / 100;
