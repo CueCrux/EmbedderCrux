@@ -40,9 +40,9 @@ export class HealthChecker {
    */
   constructor(opts) {
     this.#getTargets = opts.getTargets;
-    this.#intervalMs = opts.intervalMs ?? parseInt(process.env.POOL_HEALTH_INTERVAL_MS ?? '', 10) || DEFAULT_HEALTH_INTERVAL_MS;
-    this.#timeoutMs = opts.timeoutMs ?? parseInt(process.env.POOL_HEALTH_TIMEOUT_MS ?? '', 10) || DEFAULT_HEALTH_TIMEOUT_MS;
-    this.#unhealthyThreshold = opts.unhealthyThreshold ?? parseInt(process.env.POOL_UNHEALTHY_THRESHOLD ?? '', 10) || DEFAULT_UNHEALTHY_THRESHOLD;
+    this.#intervalMs = opts.intervalMs ?? (parseInt(process.env.POOL_HEALTH_INTERVAL_MS || '', 10) || DEFAULT_HEALTH_INTERVAL_MS);
+    this.#timeoutMs = opts.timeoutMs ?? (parseInt(process.env.POOL_HEALTH_TIMEOUT_MS || '', 10) || DEFAULT_HEALTH_TIMEOUT_MS);
+    this.#unhealthyThreshold = opts.unhealthyThreshold ?? (parseInt(process.env.POOL_UNHEALTHY_THRESHOLD || '', 10) || DEFAULT_UNHEALTHY_THRESHOLD);
   }
 
   start() {

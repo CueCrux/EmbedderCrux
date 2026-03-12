@@ -30,10 +30,10 @@ export class Discovery extends EventEmitter {
    */
   constructor(opts = {}) {
     super();
-    this.#intervalMs = opts.intervalMs ?? parseInt(process.env.POOL_DISCOVERY_INTERVAL_MS ?? '', 10) || DEFAULT_DISCOVERY_INTERVAL_MS;
-    this.#tag = opts.tag ?? process.env.POOL_DISCOVERY_TAG ?? DEFAULT_DISCOVERY_TAG;
-    this.#port = opts.port ?? parseInt(process.env.POOL_DISCOVERY_PORT ?? '', 10) || DEFAULT_EMBEDDER_PORT;
-    this.#staticTargets = parseStaticTargets(opts.staticTargets ?? process.env.POOL_TARGETS ?? '');
+    this.#intervalMs = opts.intervalMs ?? (parseInt(process.env.POOL_DISCOVERY_INTERVAL_MS || '', 10) || DEFAULT_DISCOVERY_INTERVAL_MS);
+    this.#tag = opts.tag ?? (process.env.POOL_DISCOVERY_TAG || DEFAULT_DISCOVERY_TAG);
+    this.#port = opts.port ?? (parseInt(process.env.POOL_DISCOVERY_PORT || '', 10) || DEFAULT_EMBEDDER_PORT);
+    this.#staticTargets = parseStaticTargets(opts.staticTargets ?? (process.env.POOL_TARGETS || ''));
   }
 
   /** Start the discovery loop. Runs an initial poll synchronously-ish before returning. */
