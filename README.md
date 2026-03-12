@@ -1,12 +1,12 @@
 # EmbedderCrux
 
-GPU-accelerated embedding server in a box. HuggingFace TEI + Tailscale mesh networking, single `docker compose up`.
+GPU-accelerated embedding server in a box. HuggingFace TEI + a thin gateway + Tailscale mesh networking, single `docker compose up`.
 
-EmbedderCrux is a self-contained Docker appliance that turns any NVIDIA GPU into a private embedding endpoint on your Tailscale network. It pairs HuggingFace Text Embeddings Inference (TEI) with a Tailscale sidecar so your infrastructure can call it like any internal service: no public ports, no API keys to rotate, no vendor lock-in.
+EmbedderCrux is a self-contained Docker appliance that turns any NVIDIA GPU into a private embedding endpoint on your Tailscale network. It pairs HuggingFace Text Embeddings Inference (TEI) with a small HTTP gateway and a Tailscale sidecar so your infrastructure can call it like any internal service: no public ports, no API keys to rotate, no vendor lock-in.
 
 Built to power the embedding pipeline for [VaultCrux](https://vaultcrux.com), but useful for anyone who wants fast, private, provider-independent embeddings without sending data to a third-party API.
 
-The stack also publishes TEI locally (`127.0.0.1:8080` by default) so same-host services can keep embedding lanes healthy even if tailnet auth is not yet completed.
+The stack publishes the gateway locally (`127.0.0.1:8080` by default). `/embed` remains TEI-compatible. `/embed/sequence` is available for Engine late-chunking; by default it returns `501` so Engine can fall back to per-chunk embeddings unless sequence mode is explicitly enabled.
 
 ## Why This Exists
 
@@ -90,6 +90,9 @@ Hosted embedding APIs are convenient, but they bill per token and can deprecate 
 | `MAX_CONCURRENT_REQUESTS` | TEI max in-flight requests | `512` |
 | `EMBEDDER_LOCAL_BIND` | Host/IP bind for optional local port publishing | `127.0.0.1` |
 | `EMBEDDER_HOST_PORT` | Host port mapped to TEI `:8080` | `8080` |
+| `EMBEDDER_SEQUENCE_MODE` | `/embed/sequence` mode: `disabled` or `synthetic` | `disabled` |
+| `EMBEDDER_SEQUENCE_MAX_TOKENS` | Max tokens allowed for synthetic `/embed/sequence` | `384` |
+| `EMBEDDER_TOKEN_BATCH_SIZE` | Batch size for synthetic token embedding calls | `64` |
 
 ## Tailscale ACL Policy
 
@@ -140,12 +143,30 @@ Then launch as normal with `./scripts/compose-up-from-vault.sh`. Each instance j
 
 ## Calling the Endpoint
 
-TEI `/embed` request fields used most often:
+Gateway `/embed` request fields used most often:
 
 - `inputs`: array of text strings
 - `truncate`: optional boolean
 
 Response shape: array of float arrays (one embedding vector per input string).
+
+Gateway `/embed/sequence` request fields:
+
+- `text`: one document window to embed
+- `model`: optional model label echoed in the response
+
+Response shape when enabled:
+
+- `embedding` / `pooled_embedding`: pooled document vector
+- `token_embeddings`: per-token vectors
+- `token_offsets`: `{ start, end }` character offsets
+- `tokens`: token strings
+
+Fallback behaviour:
+
+- default mode is `EMBEDDER_SEQUENCE_MODE=disabled`
+- disabled or oversized requests return `501`
+- Engine is expected to catch `404`/`501` and fall back to per-chunk embeddings
 
 ### curl
 
@@ -154,6 +175,11 @@ curl http://embedder:8080/embed \
   -X POST \
   -H 'Content-Type: application/json' \
   -d '{"inputs":["first text","second text"],"truncate":true}'
+
+curl http://embedder:8080/embed/sequence \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"One document window for late chunking."}'
 ```
 
 ### Python

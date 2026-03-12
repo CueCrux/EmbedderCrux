@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if ! curl -sf http://localhost:8080/health >/dev/null; then
-  echo "TEI health check failed: http://localhost:8080/health is unreachable."
+if ! curl -sf http://localhost:8080/healthz >/dev/null; then
+  echo "Embedder gateway health check failed: http://localhost:8080/healthz is unreachable."
   exit 1
 fi
 
@@ -11,4 +11,4 @@ if ! docker exec embedder-ts tailscale status --json >/dev/null; then
   exit 1
 fi
 
-echo "OK: TEI and Tailscale are healthy."
+echo "OK: gateway, backend, and Tailscale are healthy."

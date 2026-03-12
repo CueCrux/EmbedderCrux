@@ -1,0 +1,13 @@
+{
+  "name": "embeddercrux-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "HTTP gateway for TEI-compatible embedding and sequence embedding fallback routes.",
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

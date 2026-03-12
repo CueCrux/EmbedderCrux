@@ -84,15 +84,16 @@ cd "$ROOT_DIR"
 
 # Ensure stale CPU fallback is never left active when attempting GPU startup.
 compose_with_secrets --profile cpu-fallback rm -sf tei-cpu >/dev/null 2>&1 || true
+compose_with_secrets rm -sf gateway >/dev/null 2>&1 || true
 
 echo "[embeddercrux] starting GPU TEI (tag=${TEI_IMAGE_TAG})"
 gpu_up_ok=true
 if (( $# > 0 )); then
-  if ! compose_with_secrets up -d "$@"; then
+  if ! TEI_BACKEND_SERVICE=tei compose_with_secrets up -d "$@" gateway; then
     gpu_up_ok=false
   fi
 else
-  if ! compose_with_secrets up -d tailscale tei; then
+  if ! TEI_BACKEND_SERVICE=tei compose_with_secrets up -d tailscale tei gateway; then
     gpu_up_ok=false
   fi
 fi
@@ -116,7 +117,7 @@ fi
 
 echo "[embeddercrux] switching to CPU fallback (tag=${TEI_CPU_IMAGE_TAG})"
 compose_with_secrets rm -sf tei >/dev/null 2>&1 || true
-TEI_CPU_IMAGE_TAG="$TEI_CPU_IMAGE_TAG" compose_with_secrets --profile cpu-fallback up -d tailscale tei-cpu
+TEI_CPU_IMAGE_TAG="$TEI_CPU_IMAGE_TAG" TEI_BACKEND_SERVICE=tei-cpu compose_with_secrets --profile cpu-fallback up -d tailscale tei-cpu gateway
 
 if wait_for_tei_health "${TEI_HEALTH_TIMEOUT_SECONDS}"; then
   running_image="$(docker inspect --format '{{.Config.Image}}' embedder-tei-cpu 2>/dev/null || true)"
