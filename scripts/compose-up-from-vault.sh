@@ -16,6 +16,7 @@ fi
 : "${TEI_IMAGE_TAG:=cuda-1.9}"
 : "${TEI_CPU_IMAGE_TAG:=cpu-1.9}"
 : "${ALLOW_CPU_FALLBACK:=true}"
+: "${ALLOW_UNSUPPORTED_GPU_ATTEMPT:=false}"
 : "${TEI_HEALTH_TIMEOUT_SECONDS:=180}"
 : "${EMBEDDER_HOST_PORT:=8080}"
 
@@ -62,6 +63,36 @@ is_true() {
   [[ "$value" == "1" || "$value" == "true" || "$value" == "yes" || "$value" == "on" ]]
 }
 
+gpu_attempt_block_reason() {
+  if is_true "${ALLOW_UNSUPPORTED_GPU_ATTEMPT}"; then
+    return 1
+  fi
+
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local caps cap
+  caps="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' ' || true)"
+  if [[ -z "$caps" ]]; then
+    return 1
+  fi
+
+  while IFS= read -r cap; do
+    [[ -z "$cap" ]] && continue
+    if awk "BEGIN { exit !($cap >= 12.0) }"; then
+      case "$TEI_IMAGE_TAG" in
+        cuda-1.9|89-*|hopper-1.9|hopper-latest|hopper-*)
+          printf '%s' "GPU compute capability ${cap} detected. Current TEI image tag (${TEI_IMAGE_TAG}) does not have a known-good local path for SM 12.x/Blackwell. Set ALLOW_UNSUPPORTED_GPU_ATTEMPT=true to force the GPU attempt or use a custom TEI image with SM 12.x support."
+          return 0
+          ;;
+      esac
+    fi
+  done <<< "$caps"
+
+  return 1
+}
+
 compose_with_secrets() {
   TS_CLIENT_ID="$ts_client_id" TS_CLIENT_SECRET="$ts_client_secret" docker compose "$@"
 }
@@ -88,7 +119,11 @@ compose_with_secrets rm -sf gateway >/dev/null 2>&1 || true
 
 echo "[embeddercrux] starting GPU TEI (tag=${TEI_IMAGE_TAG})"
 gpu_up_ok=true
-if (( $# > 0 )); then
+gpu_skip_reason=""
+if gpu_skip_reason="$(gpu_attempt_block_reason)"; then
+  gpu_up_ok=false
+  echo "[embeddercrux] skipping GPU TEI: ${gpu_skip_reason}"
+elif (( $# > 0 )); then
   if ! TEI_BACKEND_SERVICE=tei compose_with_secrets up -d "$@" gateway; then
     gpu_up_ok=false
   fi
@@ -106,7 +141,11 @@ if [[ "$gpu_up_ok" == "true" ]] && wait_for_tei_health "${TEI_HEALTH_TIMEOUT_SEC
 fi
 
 if [[ "$gpu_up_ok" == "false" ]]; then
+  if [[ -n "$gpu_skip_reason" ]]; then
+    echo "[embeddercrux] GPU TEI skipped."
+  else
   echo "[embeddercrux] GPU TEI failed to start."
+  fi
 else
   echo "[embeddercrux] GPU TEI did not become healthy within ${TEI_HEALTH_TIMEOUT_SECONDS}s."
 fi
