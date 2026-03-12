@@ -26,13 +26,41 @@ discovery.on('change', ({ targets }) => {
   metrics.setDiscoveryPeers(targets.filter(t => t.source === 'tailscale').length);
 });
 
-// ── Round-robin state ─────────────────────────────────────────────────
+// ── In-flight tracking & routing ──────────────────────────────────────
 
+/** @type {Map<string, number>} in-flight request count per node id */
+const inflight = new Map();
 let rrCounter = 0;
 
+/** Increment in-flight counter for a node. */
+function inflightInc(nodeId) {
+  inflight.set(nodeId, (inflight.get(nodeId) ?? 0) + 1);
+}
+
+/** Decrement in-flight counter for a node. */
+function inflightDec(nodeId) {
+  const n = (inflight.get(nodeId) ?? 1) - 1;
+  if (n <= 0) inflight.delete(nodeId);
+  else inflight.set(nodeId, n);
+}
+
 /**
- * Select the best backend node.
- * Picks the lowest-latency node; if multiple are within `latencyBandMs`, round-robin among them.
+ * Select the best backend node using latency-weighted routing with
+ * in-flight overflow.
+ *
+ * Strategy:
+ *  1. Score each node: effective_ms = avgLatencyMs + (inflight * CONCURRENCY_PENALTY_MS)
+ *  2. This naturally pushes work to faster nodes when idle, but overflows
+ *     to slower nodes when the fast node is saturated.
+ *  3. Nodes within `latencyBandMs` of the best score are round-robined.
+ *
+ * The concurrency penalty models the queuing delay: each in-flight request
+ * on a node adds a virtual latency cost. For a fast vSwitch node (~10ms)
+ * with 1 request in flight, score = 10 + 30 = 40ms. A slower Tailscale
+ * node (~60ms) with 0 in-flight scores 60ms — so the second concurrent
+ * request goes to the remote node, which is correct since both GPUs can
+ * process in parallel.
+ *
  * @returns {{ id: string, url: string, hostname: string } | null}
  */
 function selectNode(exclude = null) {
@@ -43,9 +71,18 @@ function selectNode(exclude = null) {
 
   if (candidates.length === 0) return null;
 
-  // Group nodes within the latency band of the best node
-  const bestLatency = candidates[0].avgLatencyMs;
-  const band = candidates.filter(n => n.avgLatencyMs <= bestLatency + latencyBandMs);
+  // Score each candidate: latency + concurrency penalty
+  const concurrencyPenaltyMs = Number(process.env.POOL_CONCURRENCY_PENALTY_MS ?? 30);
+  const scored = candidates.map(n => ({
+    ...n,
+    inflight: inflight.get(n.id) ?? 0,
+    score: n.avgLatencyMs + (inflight.get(n.id) ?? 0) * concurrencyPenaltyMs,
+  }));
+  scored.sort((a, b) => a.score - b.score);
+
+  // Group nodes within the latency band of the best score
+  const bestScore = scored[0].score;
+  const band = scored.filter(n => n.score <= bestScore + latencyBandMs);
 
   // Round-robin within the band
   const idx = rrCounter++ % band.length;
@@ -130,6 +167,7 @@ async function handleProxy(req, res, route) {
     return;
   }
 
+  inflightInc(node.id);
   const start = performance.now();
   try {
     const result = await proxyTo(node.url, route, req.method, req.headers, body);
@@ -144,6 +182,8 @@ async function handleProxy(req, res, route) {
     const durationMs = performance.now() - start;
     metrics.recordRequest(node.hostname, route, 'error', durationMs);
     console.warn(`[proxy] ${node.hostname} failed for ${route}: ${err.message} — attempting retry`);
+  } finally {
+    inflightDec(node.id);
   }
 
   // Retry on a different node
@@ -153,6 +193,7 @@ async function handleProxy(req, res, route) {
     return;
   }
 
+  inflightInc(retryNode.id);
   const retryStart = performance.now();
   try {
     const result = await proxyTo(retryNode.url, route, req.method, req.headers, body);
@@ -167,6 +208,8 @@ async function handleProxy(req, res, route) {
     const durationMs = performance.now() - retryStart;
     metrics.recordRequest(retryNode.hostname, route, 'error', durationMs);
     sendJson(res, 502, { error: 'all_backends_failed', tried: [node.hostname, retryNode.hostname] });
+  } finally {
+    inflightDec(retryNode.id);
   }
 }
 
@@ -203,7 +246,10 @@ const server = http.createServer(async (req, res) => {
 
   // ── Pool status ───────────────────────────────────────────────────
   if (path === '/pool/status' && req.method === 'GET') {
-    const status = healthChecker.getPoolStatus();
+    const status = healthChecker.getPoolStatus().map(n => ({
+      ...n,
+      inflight: inflight.get(n.id) ?? 0,
+    }));
     const targets = discovery.getTargets();
     sendJson(res, 200, {
       pool_size: targets.length,

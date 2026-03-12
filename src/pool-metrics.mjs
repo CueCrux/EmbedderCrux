@@ -38,7 +38,7 @@ export class PoolMetrics {
 
   /**
    * Render Prometheus text exposition format.
-   * @param {() => Array<{ id: string, hostname: string, url: string, healthy: boolean, avgLatencyMs: number }>} getPoolStatus
+   * @param {() => Array<{ id: string, hostname: string, url: string, healthy: boolean, avgLatencyMs: number, inflight?: number }>} getPoolStatus
    * @returns {string}
    */
   render(getPoolStatus) {
@@ -61,6 +61,12 @@ export class PoolMetrics {
     lines.push('# TYPE embeddercrux_pool_node_latency_ms gauge');
     for (const n of nodes) {
       lines.push(`embeddercrux_pool_node_latency_ms{node="${esc(n.hostname)}"} ${n.avgLatencyMs}`);
+    }
+
+    lines.push('# HELP embeddercrux_pool_node_inflight Current in-flight requests to this node.');
+    lines.push('# TYPE embeddercrux_pool_node_inflight gauge');
+    for (const n of nodes) {
+      lines.push(`embeddercrux_pool_node_inflight{node="${esc(n.hostname)}"} ${n.inflight ?? 0}`);
     }
 
     lines.push('# HELP embeddercrux_pool_nodes_total Total number of pool nodes by health status.');
