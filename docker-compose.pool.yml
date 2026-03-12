@@ -1,0 +1,47 @@
+services:
+  tailscale:
+    image: tailscale/tailscale:v1.76.6
+    container_name: embedder-pool-ts
+    hostname: ${TS_HOSTNAME:-embedder-pool}
+    environment:
+      - TS_CLIENT_ID=${TS_CLIENT_ID:?set TS_CLIENT_ID from Vault}
+      - TS_CLIENT_SECRET=${TS_CLIENT_SECRET:?set TS_CLIENT_SECRET from Vault}
+      - TS_EXTRA_ARGS=--advertise-tags=tag:${TS_TAG:-infra}
+      - TS_HOSTNAME=${TS_HOSTNAME:-embedder-pool}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+    volumes:
+      - ts-state:/var/lib/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    ports:
+      - "${POOL_LOCAL_BIND:-127.0.0.1}:${POOL_HOST_PORT:-8079}:8079"
+    restart: unless-stopped
+
+  pool-router:
+    build:
+      context: .
+      dockerfile: Dockerfile.pool
+    container_name: embedder-pool-router
+    network_mode: service:tailscale
+    environment:
+      - POOL_ROUTER_PORT=8079
+      - POOL_TARGETS=${POOL_TARGETS:-}
+      - POOL_HEALTH_INTERVAL_MS=${POOL_HEALTH_INTERVAL_MS:-5000}
+      - POOL_UNHEALTHY_THRESHOLD=${POOL_UNHEALTHY_THRESHOLD:-3}
+      - POOL_LATENCY_BAND_MS=${POOL_LATENCY_BAND_MS:-20}
+      - POOL_REQUEST_TIMEOUT_MS=${POOL_REQUEST_TIMEOUT_MS:-30000}
+      - POOL_BODY_LIMIT_BYTES=${POOL_BODY_LIMIT_BYTES:-8388608}
+      - POOL_DISCOVERY_INTERVAL_MS=${POOL_DISCOVERY_INTERVAL_MS:-30000}
+      - POOL_DISCOVERY_TAG=${POOL_DISCOVERY_TAG:-tag:embedder}
+      - POOL_DISCOVERY_PORT=${POOL_DISCOVERY_PORT:-8080}
+    depends_on:
+      - tailscale
+    restart: unless-stopped
+
+volumes:
+  ts-state:
+    driver: local

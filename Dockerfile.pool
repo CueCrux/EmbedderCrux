@@ -1,0 +1,16 @@
+FROM node:22-alpine
+
+# Install tailscale CLI for `tailscale status --json` discovery
+RUN apk add --no-cache tailscale
+
+WORKDIR /app
+
+COPY package.json ./package.json
+COPY src/pool-router.mjs src/discovery.mjs src/health-checker.mjs src/pool-metrics.mjs ./src/
+
+ENV NODE_ENV=production
+ENV POOL_ROUTER_PORT=8079
+
+EXPOSE 8079
+
+CMD ["node", "src/pool-router.mjs"]
