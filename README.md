@@ -1,6 +1,10 @@
 # EmbedderCrux
 
-GPU-accelerated embedding server in a box. HuggingFace TEI + a thin gateway + Tailscale mesh networking, single `docker compose up`.
+> GPU-accelerated embedding server in a box.
+
+Part of [CueCrux](../README.md) — private, provider-independent embeddings via Tailscale mesh.
+
+HuggingFace TEI + a thin gateway + Tailscale mesh networking, single `docker compose up`.
 
 EmbedderCrux is a self-contained Docker appliance that turns any NVIDIA GPU into a private embedding endpoint on your Tailscale network. It pairs HuggingFace Text Embeddings Inference (TEI) with a small HTTP gateway and a Tailscale sidecar so your infrastructure can call it like any internal service: no public ports, no API keys to rotate, no vendor lock-in.
 
@@ -243,8 +247,11 @@ Throughput varies by model size, sequence length, and batching configuration. Th
 
 MIT (see [LICENSE](./LICENSE)).
 
-## Links
+## Key Links
 
+- Platform overview: [CueCrux README](../README.md)
+- Progress tracker: [PlanCrux/docs/master-plan/progress-tracker.md](../PlanCrux/docs/master-plan/progress-tracker.md)
+- Port registry: [PlanCrux/docs/reference/infrastructure/Port-Registry.md](../PlanCrux/docs/reference/infrastructure/Port-Registry.md)
+- Related repos: [Engine](../Engine/README.md) (embedding consumer), [FactoryCrux](../FactoryCrux/README.md) (ingestion pipeline), [VaultCrux](../VaultCrux/README.md) (retrieval platform)
 - [HuggingFace TEI documentation](https://huggingface.co/docs/text-embeddings-inference)
 - [Tailscale Docker guide](https://tailscale.com/kb/1282/docker)
-- [VaultCrux](https://vaultcrux.com)
