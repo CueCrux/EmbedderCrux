@@ -6,11 +6,6 @@ x-tei-common: &tei-common
     - MAX_BATCH_TOKENS=${MAX_BATCH_TOKENS:-16384}
     - MAX_CLIENT_BATCH_SIZE=${MAX_CLIENT_BATCH_SIZE:-64}
     - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-512}
-    # Skip the nvidia-container-toolkit NVIDIA_REQUIRE_CUDA check. The
-    # TEI image whitelists drivers 535-570; our hosts are on 580+.
-    # Torch/Candle CUDA runtime is forward-compatible, only the
-    # pre-container require-check rejects. No-op on the CPU profile.
-    - NVIDIA_DISABLE_REQUIRE=1
   command:
     - --model-id
     - ${MODEL_ID:-nomic-ai/nomic-embed-text-v1.5}
@@ -67,6 +62,8 @@ services:
     <<: *tei-common
     image: ghcr.io/huggingface/text-embeddings-inference:${TEI_IMAGE_TAG:-cuda-1.9}
     container_name: embedder-tei
+    env_file:
+      - /etc/cuecrux/gpu-defaults.env
     gpus: all
 
   tei-cpu:
