@@ -3,6 +3,9 @@ import { performance } from "node:perf_hooks";
 
 const port = Number(process.env.EMBEDDER_PORT ?? 8080);
 const teiBaseUrl = (process.env.TEI_BASE_URL ?? "http://tei:8080").replace(/\/+$/, "");
+const teiJinaBaseUrl = process.env.TEI_JINA_BASE_URL
+  ? process.env.TEI_JINA_BASE_URL.replace(/\/+$/, "")
+  : null;
 const requestTimeoutMs = Number(process.env.EMBEDDER_REQUEST_TIMEOUT_MS ?? 30_000);
 const sequenceMode = String(process.env.EMBEDDER_SEQUENCE_MODE ?? "disabled").trim().toLowerCase();
 const sequenceMaxTokens = Math.max(1, Number(process.env.EMBEDDER_SEQUENCE_MAX_TOKENS ?? 384));
@@ -85,15 +88,27 @@ async function fetchTeiHealth() {
   return { ok: response.ok, status: response.status, text };
 }
 
-async function proxyToTei(req, res, path, bodyBuffer = null) {
+function resolveBackend(url) {
+  const requested = (url.searchParams.get("model") ?? "").trim().toLowerCase();
+  if (requested === "jina") {
+    if (!teiJinaBaseUrl) {
+      return { error: "jina_backend_not_configured" };
+    }
+    return { base: teiJinaBaseUrl, model: "jina" };
+  }
+  return { base: teiBaseUrl, model: "nomic" };
+}
+
+async function proxyToTei(req, res, path, bodyBuffer = null, baseUrlOverride = null) {
   const startedAt = performance.now();
+  const base = baseUrlOverride ?? teiBaseUrl;
   try {
     const headers = {};
     if (bodyBuffer) {
       headers["content-type"] = req.headers["content-type"] ?? "application/json";
       headers["content-length"] = String(bodyBuffer.length);
     }
-    const response = await fetchWithTimeout(`${teiBaseUrl}${path}`, {
+    const response = await fetchWithTimeout(`${base}${path}`, {
       method: req.method,
       headers,
       body: bodyBuffer,
@@ -320,7 +335,17 @@ const server = http.createServer(async (req, res) => {
     if (body === null) {
       return;
     }
-    await proxyToTei(req, res, "/embed", body);
+    const backend = resolveBackend(url);
+    if (backend.error) {
+      incrementCounter("embeddercrux_backend_route_error_total", { reason: backend.error });
+      writeJson(res, 503, {
+        error: backend.error,
+        detail: "Set TEI_JINA_BASE_URL on the gateway to enable model=jina routing.",
+      });
+      return;
+    }
+    incrementCounter("embeddercrux_backend_route_total", { model: backend.model });
+    await proxyToTei(req, res, "/embed", body, backend.base);
     return;
   }
 

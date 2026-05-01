@@ -73,8 +73,31 @@ services:
     profiles:
       - cpu-fallback
 
+  jina-server:
+    build:
+      context: ./jina-server
+      dockerfile: Dockerfile
+    image: cuecrux/jina-server:${JINA_SERVER_TAG:-0.1.0}
+    container_name: embedder-jina-server
+    profiles:
+      - jina
+    volumes:
+      - jina-data:/data
+    environment:
+      - JINA_MODEL_ID=${JINA_MODEL_ID:-jinaai/jina-embeddings-v4}
+      - JINA_DEFAULT_TASK=${JINA_DEFAULT_TASK:-retrieval}
+      - JINA_DEFAULT_DIM=${JINA_DEFAULT_DIM:-2048}
+      - JINA_DTYPE=${JINA_DTYPE:-float16}
+      - PORT=8080
+    env_file:
+      - /etc/cuecrux/gpu-defaults.env
+    gpus: all
+    restart: unless-stopped
+
 volumes:
   ts-state:
     driver: local
   tei-data:
+    driver: local
+  jina-data:
     driver: local
