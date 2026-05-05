@@ -33,6 +33,34 @@ const fastNodeUrls = new Set(
 );
 const heavyRequestTokens = Number(process.env.POOL_HEAVY_REQUEST_TOKENS ?? 2048);
 
+// Remote-batch coalescer — aggregates small concurrent /embed requests
+// into large batches before sending to the remote (high-throughput) GPU,
+// amortising the Tailscale round-trip latency across many texts.
+//
+// Routing rule:
+//   • Queue empty AND batch < TARGET_TEXTS  →  immediate local routing (zero latency added)
+//   • Queue non-empty OR batch >= TARGET_TEXTS  →  accumulate + flush to remote GPU
+//
+// This means during idle / real-time query paths, every request still
+// goes straight to the local RTX 4000 at ~5 ms. During bulk embed
+// workloads (rebuild, batch ingest) requests pile up and the 5090 gets
+// large consolidated batches that amortise the ~700 ms Tailscale RTT.
+//
+// Env:
+//   POOL_REMOTE_BATCH_ENABLED=true          enable the coalescer (default off)
+//   POOL_REMOTE_BATCH_NODE_URL              remote node to send batches to
+//   POOL_REMOTE_BATCH_TARGET_TEXTS=64       flush when queue reaches this count
+//   POOL_REMOTE_BATCH_WINDOW_MS=80          max wait before flushing partial batch
+//   POOL_REMOTE_BATCH_MIN_TEXTS=16          min texts to bother sending to remote
+const remoteBatchEnabled    = process.env.POOL_REMOTE_BATCH_ENABLED === 'true';
+const remoteBatchNodeUrl    = (process.env.POOL_REMOTE_BATCH_NODE_URL ?? '').replace(/\/+$/, '');
+const remoteBatchTarget     = Number(process.env.POOL_REMOTE_BATCH_TARGET_TEXTS ?? 64);
+// Short window so even the first request waits briefly for others to arrive.
+// 20 ms adds minimal latency to real-time queries while letting concurrent
+// bulk requests accumulate into one large batch.
+const remoteBatchWindowMs   = Number(process.env.POOL_REMOTE_BATCH_WINDOW_MS    ?? 20);
+const remoteBatchMinTexts   = Number(process.env.POOL_REMOTE_BATCH_MIN_TEXTS    ?? 16);
+
 // ── Modules ───────────────────────────────────────────────────────────
 
 const discovery = new Discovery();
@@ -60,6 +88,112 @@ function inflightDec(nodeId) {
   const n = (inflight.get(nodeId) ?? 1) - 1;
   if (n <= 0) inflight.delete(nodeId);
   else inflight.set(nodeId, n);
+}
+
+// ── Remote Batch Coalescer ────────────────────────────────────────────
+
+/**
+ * @typedef {{ texts: string[], resolve: Function, reject: Function }} BatchItem
+ * @type {BatchItem[]}
+ */
+const batchQueue = [];
+let batchFlushTimer = null;
+let batchFlushInProgress = false;
+
+function scheduleBatchFlush() {
+  if (batchFlushTimer !== null) return;
+  batchFlushTimer = setTimeout(() => { batchFlushTimer = null; flushBatch(); }, remoteBatchWindowMs);
+}
+
+async function flushBatch() {
+  if (batchFlushInProgress || batchQueue.length === 0) return;
+  batchFlushInProgress = true;
+
+  const pending = batchQueue.splice(0);
+  const allTexts = pending.flatMap(p => p.texts);
+
+  // Pick remote node if healthy and batch is large enough, else local fallback
+  const healthy = healthChecker.getHealthyNodes();
+  const remoteNode = remoteBatchNodeUrl
+    ? healthy.find(n => n.url.replace(/\/+$/, '') === remoteBatchNodeUrl)
+    : null;
+  const target = (remoteNode && allTexts.length >= remoteBatchMinTexts)
+    ? remoteNode
+    : healthy.find(n => !fastNodeUrls.has(n.url.replace(/\/+$/, ''))) ?? healthy[0];
+
+  if (!target) {
+    const err = new Error('no_healthy_backends');
+    for (const p of pending) p.reject(err);
+    batchFlushInProgress = false;
+    return;
+  }
+
+  const batchBody = Buffer.from(JSON.stringify({ inputs: allTexts }));
+  const fwdHeaders = { 'content-type': 'application/json', 'content-length': String(batchBody.length) };
+  const label = (target === remoteNode) ? 'remote-coalesced' : 'local-coalesced-fallback';
+
+  inflightInc(target.id);
+  const start = performance.now();
+  try {
+    const result = await proxyTo(target.url, '/embed', 'POST', fwdHeaders, batchBody);
+    const durationMs = performance.now() - start;
+    metrics.recordRequest(target.hostname, '/embed', label, durationMs);
+
+    if (result.status !== 200) {
+      const err = new Error(`backend_${result.status}`);
+      for (const p of pending) p.reject(err);
+      return;
+    }
+
+    // Split combined response back to individual callers
+    const allVectors = JSON.parse(result.body.toString('utf8'));
+    let offset = 0;
+    for (const p of pending) {
+      const slice = allVectors.slice(offset, offset + p.texts.length);
+      const sliceBody = Buffer.from(JSON.stringify(slice));
+      p.resolve({
+        status: 200,
+        headers: { 'content-type': 'application/json', 'content-length': String(sliceBody.length) },
+        body: sliceBody,
+      });
+      offset += p.texts.length;
+    }
+  } catch (err) {
+    for (const p of pending) p.reject(err);
+  } finally {
+    inflightDec(target.id);
+    batchFlushInProgress = false;
+    // If more items arrived while we were flushing, schedule another flush
+    if (batchQueue.length > 0) scheduleBatchFlush();
+  }
+}
+
+/**
+ * Route an embed request through the coalescer.
+ * Returns a Promise<{ status, headers, body }> if the request was queued,
+ * or null if it should fall through to immediate local routing.
+ *
+ * @param {string[]} texts
+ * @returns {Promise<{ status: number, headers: Object, body: Buffer }> | null}
+ */
+function coalesceOrNull(texts) {
+  if (!remoteBatchEnabled || texts.length === 0) return null;
+  // Always queue when the coalescer is enabled. The window (default 20 ms)
+  // is short enough that real-time queries see minimal added latency, while
+  // concurrent bulk requests accumulate into a single large batch that
+  // amortises the Tailscale RTT to the remote GPU.
+  return new Promise((resolve, reject) => {
+    batchQueue.push({ texts, resolve, reject });
+    const totalQueued = batchQueue.reduce((s, p) => s + p.texts.length, 0);
+    if (totalQueued >= remoteBatchTarget) {
+      // Enough texts — flush immediately without waiting for the window.
+      clearTimeout(batchFlushTimer);
+      batchFlushTimer = null;
+      flushBatch();
+    } else {
+      scheduleBatchFlush();
+    }
+  });
 }
 
 /**
@@ -228,6 +362,31 @@ async function handleProxy(req, res, route) {
     return;
   }
 
+  // Coalescer path: accumulate concurrent requests and send as one large batch
+  // to the remote GPU. Falls through to immediate routing when queue is empty
+  // and this batch is small (real-time query path, zero latency added).
+  if (route === '/embed') {
+    let texts;
+    try {
+      const parsed = JSON.parse(body.toString('utf8'));
+      if (Array.isArray(parsed?.inputs)) texts = parsed.inputs.filter(t => typeof t === 'string');
+    } catch { /* ignore, fall through */ }
+
+    if (texts && texts.length > 0) {
+      const coalesced = coalesceOrNull(texts);
+      if (coalesced !== null) {
+        try {
+          const result = await coalesced;
+          res.writeHead(result.status, result.headers);
+          res.end(result.body);
+        } catch (err) {
+          sendJson(res, 502, { error: 'coalesced_batch_failed', message: err.message });
+        }
+        return;
+      }
+    }
+  }
+
   const tokens = estimateRequestTokens(body);
   const preferFast = tokens >= heavyRequestTokens;
   const node = selectNode(null, { preferFast });
@@ -325,11 +484,39 @@ const server = http.createServer(async (req, res) => {
       inflight: inflight.get(n.id) ?? 0,
     }));
     const targets = discovery.getTargets();
+    const queuedTexts = batchQueue.reduce((s, p) => s + p.texts.length, 0);
     sendJson(res, 200, {
       pool_size: targets.length,
       healthy: status.filter(n => n.healthy).length,
       unhealthy: status.filter(n => !n.healthy).length,
       nodes: status,
+      ...(remoteBatchEnabled && {
+        remote_batch: {
+          enabled: true,
+          remote_node: remoteBatchNodeUrl || null,
+          queue_depth: batchQueue.length,
+          queued_texts: queuedTexts,
+          target_texts: remoteBatchTarget,
+          window_ms: remoteBatchWindowMs,
+          flush_in_progress: batchFlushInProgress,
+        },
+      }),
+    });
+    return;
+  }
+
+  // ── Batch status ──────────────────────────────────────────────────
+  if (path === '/pool/batch-status' && req.method === 'GET') {
+    const queuedTexts = batchQueue.reduce((s, p) => s + p.texts.length, 0);
+    sendJson(res, 200, {
+      enabled: remoteBatchEnabled,
+      remote_node: remoteBatchNodeUrl || null,
+      queue_depth: batchQueue.length,
+      queued_texts: queuedTexts,
+      target_texts: remoteBatchTarget,
+      window_ms: remoteBatchWindowMs,
+      min_texts: remoteBatchMinTexts,
+      flush_in_progress: batchFlushInProgress,
     });
     return;
   }

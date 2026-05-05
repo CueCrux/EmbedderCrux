@@ -22,12 +22,9 @@ x-tei-common: &tei-common
   volumes:
     - tei-cache:/data
   shm_size: 1g
-  # Memory limit sized to the WSL2 host (effective ~23 GB including
-  # Docker Desktop's VM overhead). Earlier 12g cap caused cgroup-OOM
-  # restart loops every ~30 s under load — host was swap-thrashing
-  # before TEI hit the cap. 6 GB is the verified steady-state working
-  # size for BGE-M3 at the tightened batch limits below.
-  mem_limit: 6g
+  # 10 GB on 28 GB WSL2 VM (47.5 GB host). Gives ~4 GB activation
+  # headroom over BGE-M3 steady-state (~5.9 GB) for batch=128 runs.
+  mem_limit: 10g
   # GPU access — both containers share GPU 0 (the 5090).
   deploy:
     resources:
@@ -58,15 +55,15 @@ services:
       - float16
       - --port
       - "80"
-      # Tightened to match the Hetzner backend's stable profile after
-      # 2026-05-06 cgroup-OOM restart-loop incident. WSL2 host can't
-      # sustain the original 16384-token / 256-concurrent peak.
+      # 128 concurrent needed for batch=128 (1 permit per text in TEI).
+      # 6g mem_limit guards against OOM; original OOM was at 256 concurrent
+      # without mem_limit, not an issue now.
       - --max-batch-tokens
-      - "8192"
+      - "16384"
       - --max-client-batch-size
-      - "32"
+      - "128"
       - --max-concurrent-requests
-      - "64"
+      - "128"
       - --payload-limit
       - "16777216"
 

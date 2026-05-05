@@ -95,6 +95,13 @@ services:
       - POOL_FAST_NODE_URLS=http://100.92.27.92:8089
       - POOL_HEAVY_REQUEST_TOKENS=2048
       - POOL_CONCURRENCY_PENALTY_MS=30
+      # Remote-batch coalescer — aggregates concurrent small requests into
+      # large batches for the 5090, amortising the Tailscale RTT.
+      - POOL_REMOTE_BATCH_ENABLED=true
+      - POOL_REMOTE_BATCH_NODE_URL=http://100.92.27.92:8089
+      - POOL_REMOTE_BATCH_TARGET_TEXTS=64
+      - POOL_REMOTE_BATCH_WINDOW_MS=20
+      - POOL_REMOTE_BATCH_MIN_TEXTS=16
     depends_on:
       bgem3-dense:
         condition: service_healthy
