@@ -1,0 +1,104 @@
+# Hetzner-side BGE-M3 + pool-router stack.
+#
+# - bgem3-dense (port 8189, localhost-only): RTX 4000 BGE-M3 backend
+# - pool-router (port 8086, localhost-only): LB across the local backend
+#   AND the remote 5090 backend at 100.92.27.92:8089
+#
+# corecruxd points at http://127.0.0.1:8086 — when the 5090 dies the
+# router auto-fails over to the local Hetzner backend.
+
+x-tei-common: &tei-common
+  image: ghcr.io/huggingface/text-embeddings-inference:89-1.9
+  restart: unless-stopped
+  shm_size: 1g
+  mem_limit: 8g
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+  healthcheck:
+    test: ['CMD-SHELL', 'curl -sf -m 5 http://localhost:80/health || exit 1']
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 90s
+
+services:
+  bgem3-dense:
+    <<: *tei-common
+    container_name: embedder-bgem3-dense
+    volumes:
+      - tei-cache:/data
+    ports:
+      - '127.0.0.1:8189:80'
+    command:
+      - --model-id
+      - BAAI/bge-m3
+      - --dtype
+      - float16
+      - --port
+      - '80'
+      - --max-batch-tokens
+      - '8192'
+      - --max-client-batch-size
+      - '64'
+      - --max-concurrent-requests
+      - '128'
+      - --payload-limit
+      - '16777216'
+
+  reranker:
+    <<: *tei-common
+    container_name: embedder-reranker
+    volumes:
+      - tei-cache:/data
+    ports:
+      - '127.0.0.1:8190:80'
+    command:
+      - --model-id
+      - BAAI/bge-reranker-v2-m3
+      - --dtype
+      - float16
+      - --port
+      - '80'
+      - --max-batch-tokens
+      - '8192'
+      - --max-client-batch-size
+      - '64'
+      - --max-concurrent-requests
+      - '64'
+      - --payload-limit
+      - '16777216'
+
+  pool-router:
+    build:
+      context: .
+      dockerfile: Dockerfile.pool
+    image: cuecrux/embedder-pool-router:0.1.0
+    container_name: embedder-pool-router
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - POOL_ROUTER_PORT=8086
+      # 5090 (fast, primary) + Hetzner local (failover)
+      - POOL_TARGETS=http://100.92.27.92:8089,http://127.0.0.1:8189
+      # Skip Tailscale tag discovery — we already have explicit targets.
+      - POOL_DISCOVERY_INTERVAL_MS=300000
+      - POOL_HEALTH_INTERVAL_MS=5000
+      - POOL_UNHEALTHY_THRESHOLD=2
+      - POOL_LATENCY_BAND_MS=20
+      - POOL_REQUEST_TIMEOUT_MS=30000
+      - POOL_BODY_LIMIT_BYTES=16777216
+      - POOL_FAST_NODE_URLS=http://100.92.27.92:8089
+      - POOL_HEAVY_REQUEST_TOKENS=2048
+      - POOL_CONCURRENCY_PENALTY_MS=30
+    depends_on:
+      bgem3-dense:
+        condition: service_healthy
+
+volumes:
+  tei-cache:
+    name: tei-cache

@@ -15,6 +15,24 @@ const requestTimeoutMs = Number(process.env.POOL_REQUEST_TIMEOUT_MS ?? 30_000);
 const latencyBandMs = Number(process.env.POOL_LATENCY_BAND_MS ?? 20);
 const bodyLimitBytes = Math.max(1024, Number(process.env.POOL_BODY_LIMIT_BYTES ?? 8 * 1024 * 1024));
 
+// Size/speed routing — when the request batch is large enough that
+// inference dominates network round-trip, prefer the high-throughput
+// backend (e.g. the 5090) even if it has higher network latency. Small
+// queries keep the latency-weighted routing.
+//
+// `POOL_FAST_NODE_URLS` is a comma-separated allow-list of backend
+// URLs that are known to be fast on heavy batches (5090, A100 etc.).
+// `POOL_HEAVY_REQUEST_TOKENS` is the rough token-count threshold; we
+// estimate tokens as `total_chars / 4` so batches over ~2048 tokens
+// (~8 KB of input text) prefer the fast node by default.
+const fastNodeUrls = new Set(
+  String(process.env.POOL_FAST_NODE_URLS ?? '')
+    .split(',')
+    .map(s => s.trim().replace(/\/+$/, ''))
+    .filter(Boolean),
+);
+const heavyRequestTokens = Number(process.env.POOL_HEAVY_REQUEST_TOKENS ?? 2048);
+
 // ── Modules ───────────────────────────────────────────────────────────
 
 const discovery = new Discovery();
@@ -63,13 +81,35 @@ function inflightDec(nodeId) {
  *
  * @returns {{ id: string, url: string, hostname: string } | null}
  */
-function selectNode(exclude = null) {
+function selectNode(exclude = null, opts = {}) {
+  const { preferFast = false } = opts;
   const healthy = healthChecker.getHealthyNodes(); // sorted by avgLatencyMs asc
   const candidates = exclude
     ? healthy.filter(n => n.id !== exclude)
     : healthy;
 
   if (candidates.length === 0) return null;
+
+  // Heavy-request short-circuit: when the batch is large enough that
+  // the fast GPU's higher throughput beats the slower node's lower
+  // network latency, route to a "fast" node (allow-listed via
+  // POOL_FAST_NODE_URLS). Falls back to standard routing if no fast
+  // node is healthy.
+  if (preferFast && fastNodeUrls.size > 0) {
+    const fast = candidates.filter(n => fastNodeUrls.has(n.url.replace(/\/+$/, '')));
+    if (fast.length > 0) {
+      // Within fast nodes, still respect concurrency penalty.
+      const concurrencyPenaltyMs = Number(process.env.POOL_CONCURRENCY_PENALTY_MS ?? 30);
+      const scored = fast.map(n => ({
+        ...n,
+        inflight: inflight.get(n.id) ?? 0,
+        score: n.avgLatencyMs + (inflight.get(n.id) ?? 0) * concurrencyPenaltyMs,
+      }));
+      scored.sort((a, b) => a.score - b.score);
+      return scored[0];
+    }
+    // No healthy fast node — log + fall through to default.
+  }
 
   // Score each candidate: latency + concurrency penalty
   const concurrencyPenaltyMs = Number(process.env.POOL_CONCURRENCY_PENALTY_MS ?? 30);
@@ -87,6 +127,33 @@ function selectNode(exclude = null) {
   // Round-robin within the band
   const idx = rrCounter++ % band.length;
   return band[idx];
+}
+
+/**
+ * Estimate the request weight in tokens.
+ * `body` is the raw request bytes; we parse JSON best-effort and sum
+ * the lengths of each `inputs` entry. Tokens ≈ chars / 4 (rough but
+ * good enough for routing). Returns 0 on parse failure.
+ *
+ * @param {Buffer} body
+ * @returns {number}
+ */
+function estimateRequestTokens(body) {
+  try {
+    const obj = JSON.parse(body.toString('utf8'));
+    const inputs = obj?.inputs;
+    let chars = 0;
+    if (Array.isArray(inputs)) {
+      for (const it of inputs) {
+        if (typeof it === 'string') chars += it.length;
+      }
+    } else if (typeof inputs === 'string') {
+      chars = inputs.length;
+    }
+    return Math.ceil(chars / 4);
+  } catch {
+    return 0;
+  }
 }
 
 // ── Request Proxy ─────────────────────────────────────────────────────
@@ -161,10 +228,15 @@ async function handleProxy(req, res, route) {
     return;
   }
 
-  const node = selectNode();
+  const tokens = estimateRequestTokens(body);
+  const preferFast = tokens >= heavyRequestTokens;
+  const node = selectNode(null, { preferFast });
   if (!node) {
     sendJson(res, 503, { error: 'no_healthy_backends', pool_size: discovery.getTargets().length });
     return;
+  }
+  if (preferFast) {
+    metrics.recordRequest(node.hostname, route, 'fast-pref', 0);
   }
 
   inflightInc(node.id);
@@ -186,8 +258,10 @@ async function handleProxy(req, res, route) {
     inflightDec(node.id);
   }
 
-  // Retry on a different node
-  const retryNode = selectNode(node.id);
+  // Retry on a different node — keep the same fast-preference so a
+  // heavy batch that lost its primary fast node still tries the other
+  // fast node first if there is one, before falling through.
+  const retryNode = selectNode(node.id, { preferFast });
   if (!retryNode) {
     sendJson(res, 502, { error: 'backend_unavailable', tried: node.hostname });
     return;

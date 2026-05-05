@@ -1,0 +1,100 @@
+# BGE-M3 dual-TEI stack on the local 5090 box.
+#
+# Replaces the ad-hoc `docker run` flow that was killing BGE-M3 under
+# load (host RAM OOM at 5.6 GB anon-rss / 153 GB virt — see
+# `dmesg | grep oom` after the 2026-05-05 12:43 incident).
+#
+# Two TEI containers, both pinned to compose-managed config:
+#   - embedder-bgem3-dense  (port 8089) — BAAI/bge-m3 dense pooling
+#   - embedder-splade-sparse (port 8090) — naver/splade-cocondenser-ensembledistil
+#
+# Both image: ghcr.io/huggingface/text-embeddings-inference:120-1.9
+# (cu120 = Blackwell SM120 = RTX 5090).
+#
+# Bring up:
+#   docker compose -f docker-compose.bge.yml up -d
+# Tear down:
+#   docker compose -f docker-compose.bge.yml down
+
+x-tei-common: &tei-common
+  image: ghcr.io/huggingface/text-embeddings-inference:120-1.9
+  restart: unless-stopped
+  volumes:
+    - tei-cache:/data
+  shm_size: 1g
+  # Memory limit sized to the WSL2 host (effective ~23 GB including
+  # Docker Desktop's VM overhead). Earlier 12g cap caused cgroup-OOM
+  # restart loops every ~30 s under load — host was swap-thrashing
+  # before TEI hit the cap. 6 GB is the verified steady-state working
+  # size for BGE-M3 at the tightened batch limits below.
+  mem_limit: 6g
+  # GPU access — both containers share GPU 0 (the 5090).
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+  healthcheck:
+    test: ["CMD-SHELL", "curl -sf -m 5 http://localhost:80/health || exit 1"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 60s
+
+services:
+  bgem3-dense:
+    <<: *tei-common
+    container_name: embedder-bgem3-dense
+    ports:
+      # 0.0.0.0 binding (covers 127.0.0.1 too) so the Hetzner-side
+      # pool-router can reach 100.92.27.92:8089 over Tailscale.
+      - "0.0.0.0:8089:80"
+    command:
+      - --model-id
+      - BAAI/bge-m3
+      - --dtype
+      - float16
+      - --port
+      - "80"
+      # Tightened to match the Hetzner backend's stable profile after
+      # 2026-05-06 cgroup-OOM restart-loop incident. WSL2 host can't
+      # sustain the original 16384-token / 256-concurrent peak.
+      - --max-batch-tokens
+      - "8192"
+      - --max-client-batch-size
+      - "32"
+      - --max-concurrent-requests
+      - "64"
+      - --payload-limit
+      - "16777216"
+
+  splade-sparse:
+    <<: *tei-common
+    container_name: embedder-splade-sparse
+    ports:
+      - "0.0.0.0:8090:80"
+    command:
+      - --model-id
+      - naver/splade-cocondenser-ensembledistil
+      - --dtype
+      - float16
+      - --pooling
+      - splade
+      - --port
+      - "80"
+      # Match bgem3-dense limits — both share the same 23 GB WSL2 box.
+      - --max-batch-tokens
+      - "8192"
+      - --max-client-batch-size
+      - "32"
+      - --max-concurrent-requests
+      - "64"
+      - --payload-limit
+      - "16777216"
+
+volumes:
+  tei-cache:
+    name: tei-cache
+    external: true
