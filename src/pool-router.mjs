@@ -98,18 +98,29 @@ function inflightDec(nodeId) {
  */
 const batchQueue = [];
 let batchFlushTimer = null;
-let batchFlushInProgress = false;
+// Max parallel in-flight flushes to the remote GPU.
+// TEI grants 1 permit per text; with target=128 texts per flush,
+// PARALLEL_FLUSHES=N requires max-concurrent-requests >= 128*N on the TEI.
+// Default 1 (sequential). Raise only if TEI permits allow it.
+const remoteBatchParallelFlushes = Number(process.env.POOL_REMOTE_BATCH_PARALLEL_FLUSHES ?? 1);
+let activeFlushes = 0;
 
 function scheduleBatchFlush() {
   if (batchFlushTimer !== null) return;
-  batchFlushTimer = setTimeout(() => { batchFlushTimer = null; flushBatch(); }, remoteBatchWindowMs);
+  batchFlushTimer = setTimeout(() => { batchFlushTimer = null; maybeFlush(); }, remoteBatchWindowMs);
+}
+
+function maybeFlush() {
+  while (activeFlushes < remoteBatchParallelFlushes && batchQueue.length > 0) {
+    activeFlushes++;
+    flushBatch().finally(() => { activeFlushes--; if (batchQueue.length > 0) maybeFlush(); });
+  }
 }
 
 async function flushBatch() {
-  if (batchFlushInProgress || batchQueue.length === 0) return;
-  batchFlushInProgress = true;
-
-  const pending = batchQueue.splice(0);
+  // Take up to TARGET_TEXTS items — leaves the rest for the next parallel flush.
+  const pending = batchQueue.splice(0, remoteBatchTarget);
+  if (pending.length === 0) return;
   const allTexts = pending.flatMap(p => p.texts);
 
   // Pick remote node if healthy and batch is large enough, else local fallback
@@ -124,7 +135,6 @@ async function flushBatch() {
   if (!target) {
     const err = new Error('no_healthy_backends');
     for (const p of pending) p.reject(err);
-    batchFlushInProgress = false;
     return;
   }
 
@@ -162,9 +172,6 @@ async function flushBatch() {
     for (const p of pending) p.reject(err);
   } finally {
     inflightDec(target.id);
-    batchFlushInProgress = false;
-    // If more items arrived while we were flushing, schedule another flush
-    if (batchQueue.length > 0) scheduleBatchFlush();
   }
 }
 
@@ -189,7 +196,7 @@ function coalesceOrNull(texts) {
       // Enough texts — flush immediately without waiting for the window.
       clearTimeout(batchFlushTimer);
       batchFlushTimer = null;
-      flushBatch();
+      maybeFlush();
     } else {
       scheduleBatchFlush();
     }
@@ -498,7 +505,7 @@ const server = http.createServer(async (req, res) => {
           queued_texts: queuedTexts,
           target_texts: remoteBatchTarget,
           window_ms: remoteBatchWindowMs,
-          flush_in_progress: batchFlushInProgress,
+          parallel_flushes_enabled: true,
         },
       }),
     });
@@ -516,7 +523,7 @@ const server = http.createServer(async (req, res) => {
       target_texts: remoteBatchTarget,
       window_ms: remoteBatchWindowMs,
       min_texts: remoteBatchMinTexts,
-      flush_in_progress: batchFlushInProgress,
+          active_flushes: activeFlushes,
     });
     return;
   }

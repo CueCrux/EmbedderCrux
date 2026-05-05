@@ -55,15 +55,15 @@ services:
       - float16
       - --port
       - "80"
-      # 128 concurrent needed for batch=128 (1 permit per text in TEI).
-      # 6g mem_limit guards against OOM; original OOM was at 256 concurrent
-      # without mem_limit, not an issue now.
+      # 256 concurrent = 2 parallel flushes × 128 texts each.
+      # Pipelines network RTT with GPU compute to saturate the 5090.
+      # 10g mem_limit provides headroom for the doubled activation peak.
       - --max-batch-tokens
       - "16384"
       - --max-client-batch-size
       - "128"
       - --max-concurrent-requests
-      - "128"
+      - "384"
       - --payload-limit
       - "16777216"
 

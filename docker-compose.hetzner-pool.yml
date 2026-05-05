@@ -102,6 +102,8 @@ services:
       - POOL_REMOTE_BATCH_TARGET_TEXTS=64
       - POOL_REMOTE_BATCH_WINDOW_MS=20
       - POOL_REMOTE_BATCH_MIN_TEXTS=16
+      # 2 parallel flushes: keeps GPU busy while next batch is in transit
+      - POOL_REMOTE_BATCH_PARALLEL_FLUSHES=2
     depends_on:
       bgem3-dense:
         condition: service_healthy
