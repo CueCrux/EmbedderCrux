@@ -10,6 +10,10 @@ export class PoolMetrics {
   #requestCounts = new Map();
   /** @type {Map<string, { sum: number, count: number }>} keyed by label combo */
   #requestDurations = new Map();
+  /** @type {Map<string, number>} keyed by backend */
+  #pinnedRequests = new Map();
+  /** @type {Map<string, number>} keyed by reason */
+  #pinned503 = new Map();
   #discoveryPeers = 0;
   #discoveryLastSuccess = 0;
 
@@ -28,6 +32,16 @@ export class PoolMetrics {
     dur.sum += durationMs / 1000; // seconds
     dur.count += 1;
     this.#requestDurations.set(key, dur);
+  }
+
+  /** Record a request that explicitly pinned its backend. */
+  recordPinnedRequest(backend) {
+    this.#pinnedRequests.set(backend, (this.#pinnedRequests.get(backend) ?? 0) + 1);
+  }
+
+  /** Record a pinned request rejected with 503. */
+  recordPinned503(reason) {
+    this.#pinned503.set(reason, (this.#pinned503.get(reason) ?? 0) + 1);
   }
 
   /** Update discovery peer count. */
@@ -89,6 +103,18 @@ export class PoolMetrics {
       const labelStr = `node="${esc(node)}",route="${esc(route)}"`;
       lines.push(`embeddercrux_pool_request_duration_seconds_sum{${labelStr}} ${dur.sum.toFixed(6)}`);
       lines.push(`embeddercrux_pool_request_duration_seconds_count{${labelStr}} ${dur.count}`);
+    }
+
+    lines.push('# HELP embeddercrux_pool_pinned_requests_total Requests routed by X-Pool-Pin-Backend.');
+    lines.push('# TYPE embeddercrux_pool_pinned_requests_total counter');
+    for (const [backend, count] of this.#pinnedRequests) {
+      lines.push(`embeddercrux_pool_pinned_requests_total{backend="${esc(backend)}"} ${count}`);
+    }
+
+    lines.push('# HELP embeddercrux_pool_pinned_503_total Pinned requests rejected with 503 by reason.');
+    lines.push('# TYPE embeddercrux_pool_pinned_503_total counter');
+    for (const [reason, count] of this.#pinned503) {
+      lines.push(`embeddercrux_pool_pinned_503_total{reason="${esc(reason)}"} ${count}`);
     }
 
     // ── Discovery ─────────────────────────────────────────────────────

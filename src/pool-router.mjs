@@ -276,6 +276,41 @@ function selectNode(exclude = null, opts = {}) {
   return band[idx];
 }
 
+function normalizeBackendPin(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  try {
+    return new URL(raw).host;
+  } catch {
+    return raw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+  }
+}
+
+function backendRefs(node) {
+  const url = new URL(node.url);
+  const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+  return new Set([
+    url.host,
+    `${url.hostname}:${port}`,
+    `${node.hostname}:${port}`,
+  ]);
+}
+
+function selectPinnedNode(pinBackend) {
+  const pin = normalizeBackendPin(pinBackend);
+  if (!pin) return { node: null, reason: null };
+
+  const all = healthChecker.getPoolStatus();
+  const match = all.find(n => backendRefs(n).has(pin));
+  if (!match) {
+    return { node: null, reason: 'unknown_backend' };
+  }
+  if (!match.healthy) {
+    return { node: null, reason: 'unhealthy' };
+  }
+  return { node: match, reason: null };
+}
+
 /**
  * Estimate the request weight in tokens.
  * `body` is the raw request bytes; we parse JSON best-effort and sum
@@ -372,6 +407,36 @@ async function handleProxy(req, res, route) {
     body = await readBody(req);
   } catch {
     sendJson(res, 413, { error: 'request_body_too_large' });
+    return;
+  }
+
+  const pinBackend = normalizeBackendPin(req.headers['x-pool-pin-backend']);
+  if (pinBackend) {
+    const { node, reason } = selectPinnedNode(pinBackend);
+    if (!node) {
+      const rejectReason = reason ?? 'unknown_backend';
+      metrics.recordPinned503(rejectReason);
+      sendJson(res, 503, { error: 'pinned_backend_unavailable', reason: rejectReason, backend: pinBackend });
+      return;
+    }
+
+    inflightInc(node.id);
+    const start = performance.now();
+    try {
+      const result = await proxyTo(node.url, route, req.method, req.headers, body);
+      const durationMs = performance.now() - start;
+      const statusBucket = `${Math.floor(result.status / 100)}xx`;
+      metrics.recordRequest(node.hostname, route, statusBucket, durationMs);
+      metrics.recordPinnedRequest(pinBackend);
+      res.writeHead(result.status, result.headers);
+      res.end(result.body);
+    } catch (err) {
+      const durationMs = performance.now() - start;
+      metrics.recordRequest(node.hostname, route, 'error', durationMs);
+      sendJson(res, 502, { error: 'pinned_backend_failed', backend: pinBackend, message: err.message });
+    } finally {
+      inflightDec(node.id);
+    }
     return;
   }
 
