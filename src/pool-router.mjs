@@ -105,6 +105,12 @@ let batchFlushTimer = null;
 const remoteBatchParallelFlushes = Number(process.env.POOL_REMOTE_BATCH_PARALLEL_FLUSHES ?? 1);
 let activeFlushes = 0;
 
+// `/info` passthrough cache. Backends rarely change served_model_name
+// at runtime, so a one-minute cache is fine and avoids hammering them.
+const INFO_CACHE_TTL_MS = 60_000;
+let infoCache = null;
+let infoCacheAt = 0;
+
 function scheduleBatchFlush() {
   if (batchFlushTimer !== null) return;
   batchFlushTimer = setTimeout(() => { batchFlushTimer = null; maybeFlush(); }, remoteBatchWindowMs);
@@ -536,6 +542,45 @@ const server = http.createServer(async (req, res) => {
       'Content-Length': Buffer.byteLength(body),
     });
     res.end(body);
+    return;
+  }
+
+  // ── Backend info passthrough ──────────────────────────────────────
+  // Lets seal-time code (corecrux-storage / corecruxctl) ask the pool
+  // which model is actually being served, instead of stamping a
+  // hardcoded literal into .ccxe headers. Picks any healthy node and
+  // proxies its /info; result is cached for 60 s. If no backend is
+  // healthy, returns 503 so the caller can stamp "unknown-embedder"
+  // rather than a misleading default.
+  if (path === '/info' && req.method === 'GET') {
+    const now = Date.now();
+    if (infoCache && now - infoCacheAt < INFO_CACHE_TTL_MS) {
+      sendJson(res, 200, infoCache);
+      return;
+    }
+    const healthy = healthChecker.getHealthyNodes();
+    if (healthy.length === 0) {
+      sendJson(res, 503, { error: 'no_healthy_backends' });
+      return;
+    }
+    try {
+      const proxied = await proxyTo(healthy[0].url, '/info', 'GET', {}, null);
+      if (proxied.status === 200) {
+        try {
+          const parsed = JSON.parse(proxied.body.toString('utf8'));
+          infoCache = parsed;
+          infoCacheAt = now;
+          sendJson(res, 200, parsed);
+          return;
+        } catch {
+          // fall through and write raw
+        }
+      }
+      res.writeHead(proxied.status, proxied.headers);
+      res.end(proxied.body);
+    } catch (err) {
+      sendJson(res, 502, { error: 'info_proxy_failed', message: String(err?.message ?? err) });
+    }
     return;
   }
 
