@@ -4,11 +4,14 @@
 # load (host RAM OOM at 5.6 GB anon-rss / 153 GB virt — see
 # `dmesg | grep oom` after the 2026-05-05 12:43 incident).
 #
-# Two TEI containers, both pinned to compose-managed config:
-#   - embedder-bgem3-dense  (port 8089) — BAAI/bge-m3 dense pooling
-#   - embedder-splade-sparse (port 8090) — naver/splade-cocondenser-ensembledistil
+# Three TEI containers, all pinned to compose-managed config:
+#   - embedder-bgem3-dense    (port 8089) — BAAI/bge-m3 dense pooling
+#   - embedder-splade-sparse  (port 8090) — naver/splade-cocondenser-ensembledistil
+#   - embedder-rerank-bgem3   (port 8190) — BAAI/bge-reranker-v2-m3 cross-encoder
+#       (Phase-0 of recall-staged plan 2026-05-08; primary reranker, with
+#        the Hetzner-side TEI on 100.111.227.102:8190 as fallback.)
 #
-# Both image: ghcr.io/huggingface/text-embeddings-inference:120-1.9
+# All image: ghcr.io/huggingface/text-embeddings-inference:120-1.9
 # (cu120 = Blackwell SM120 = RTX 5090).
 #
 # Bring up:
@@ -82,12 +85,58 @@ services:
       - --port
       - "80"
       # Match bgem3-dense limits — both share the same 23 GB WSL2 box.
+      # max-concurrent-requests bumped 64→512: corecruxctl rebuild-companions
+      # fans out concurrency=4 requests with large batches, blowing past the
+      # 64-permit semaphore and tripping `try_acquire_permit: no permits
+      # available` → HTTP 429 (rejecting >700 of 36k requests in a 1h
+      # rebuild). 5090 has the headroom; the bottleneck is permit count.
       - --max-batch-tokens
       - "8192"
       - --max-client-batch-size
       - "32"
       - --max-concurrent-requests
-      - "64"
+      - "512"
+      - --payload-limit
+      - "16777216"
+
+  # Phase-0 (recall-staged 2026-05-08): primary cross-encoder reranker on the
+  # 5090. Mirror of the Hetzner-side TEI at 100.111.227.102:8190 which stays
+  # online as fallback. The 5090 has 2-3× the FP16 throughput; moving rerank
+  # here de-contends GPU work on the corecrux-gpu-1 RTX 4000 (which keeps
+  # doing BM25 + dense embeds for the dataplane).
+  #
+  # Model footprint: ~2.3 GB FP16 weights + activations ≈ 4 GB GPU RAM at
+  # batch=128. 5090 has ~21 GB free even with bgem3-dense + splade resident,
+  # so this fits comfortably.
+  rerank-bgem3:
+    <<: *tei-common
+    container_name: embedder-rerank-bgem3
+    # 8 GB host RAM. TEI rerankers are GPU-bound at steady state but the
+    # initial model download + safetensors mmap-and-decode peaks much
+    # higher than the runtime working-set. 5 GB OOM-killed during boot
+    # (exit 137); 8 GB has a comfortable margin and still leaves >12 GB
+    # for bgem3-dense + splade-sparse on the same 28 GB WSL2 VM.
+    mem_limit: 8g
+    ports:
+      - "0.0.0.0:8190:80"
+    command:
+      - --model-id
+      - BAAI/bge-reranker-v2-m3
+      - --dtype
+      - float16
+      - --port
+      - "80"
+      # Rerank windows in production are 10–30 (chunk, query) pairs per
+      # call. max-client-batch-size=128 covers any reasonable Phase-0
+      # ladder; max-concurrent-requests=256 lets the corecrux-gpu-1
+      # dataplane fan out under concurrency=6 LME-M probes without
+      # 429-throttling.
+      - --max-batch-tokens
+      - "16384"
+      - --max-client-batch-size
+      - "128"
+      - --max-concurrent-requests
+      - "256"
       - --payload-limit
       - "16777216"
 
