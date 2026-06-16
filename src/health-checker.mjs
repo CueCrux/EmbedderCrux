@@ -20,6 +20,13 @@ const DEFAULT_HEALTH_INTERVAL_MS = 5_000;
 const DEFAULT_HEALTH_TIMEOUT_MS = 2_000;
 const DEFAULT_UNHEALTHY_THRESHOLD = 3;
 const EMA_ALPHA = 0.3;
+// Circuit-breaker on REAL traffic outcomes (not just /healthz pings). A backend
+// can pass /healthz while failing every /embed (5xx / timeout) — the flaky-5090
+// case. After this many consecutive traffic failures the node is EJECTED from
+// rotation for the cooldown, even if /healthz still passes; a real success (or
+// the cooldown expiring → half-open) re-admits it.
+const DEFAULT_TRAFFIC_EJECT_THRESHOLD = 3;
+const DEFAULT_EJECT_COOLDOWN_MS = 30_000;
 
 export class HealthChecker {
   /** @type {Map<string, NodeStatus>} keyed by target.id */
@@ -28,6 +35,8 @@ export class HealthChecker {
   #intervalMs;
   #timeoutMs;
   #unhealthyThreshold;
+  #trafficEjectThreshold;
+  #ejectCooldownMs;
   /** @type {() => Target[]} */
   #getTargets;
 
@@ -43,6 +52,8 @@ export class HealthChecker {
     this.#intervalMs = opts.intervalMs ?? (parseInt(process.env.POOL_HEALTH_INTERVAL_MS || '', 10) || DEFAULT_HEALTH_INTERVAL_MS);
     this.#timeoutMs = opts.timeoutMs ?? (parseInt(process.env.POOL_HEALTH_TIMEOUT_MS || '', 10) || DEFAULT_HEALTH_TIMEOUT_MS);
     this.#unhealthyThreshold = opts.unhealthyThreshold ?? (parseInt(process.env.POOL_UNHEALTHY_THRESHOLD || '', 10) || DEFAULT_UNHEALTHY_THRESHOLD);
+    this.#trafficEjectThreshold = opts.trafficEjectThreshold ?? (parseInt(process.env.POOL_TRAFFIC_EJECT_THRESHOLD || '', 10) || DEFAULT_TRAFFIC_EJECT_THRESHOLD);
+    this.#ejectCooldownMs = opts.ejectCooldownMs ?? (parseInt(process.env.POOL_EJECT_COOLDOWN_MS || '', 10) || DEFAULT_EJECT_COOLDOWN_MS);
   }
 
   start() {
@@ -67,14 +78,45 @@ export class HealthChecker {
    * @returns {Array<{ id: string } & NodeStatus>}
    */
   getHealthyNodes() {
+    const now = Date.now();
     const healthy = [];
     for (const [id, status] of this.#nodes) {
-      if (status.healthy) {
+      // Healthy = passes /healthz AND not currently circuit-ejected on real
+      // traffic. The ejection overrides a passing /healthz so a backend that
+      // pings OK but 5xxs every /embed is kept out of rotation for the cooldown.
+      if (status.healthy && (status.ejectedUntil ?? 0) <= now) {
         healthy.push({ id, ...status });
       }
     }
     healthy.sort((a, b) => a.avgLatencyMs - b.avgLatencyMs);
     return healthy;
+  }
+
+  /**
+   * Feed a REAL /embed (or /info) traffic outcome into the circuit breaker.
+   * Called by the router after every backend request. Closes the gap where a
+   * backend passes /healthz but fails real traffic — without this, the router
+   * keeps picking it and rejecting callers (the 502 over-routing pathology).
+   * @param {string} nodeId
+   * @param {boolean} ok — true if the backend returned a usable (<500) response
+   */
+  recordTrafficOutcome(nodeId, ok) {
+    const node = this.#nodes.get(nodeId);
+    if (!node) return;
+    if (ok) {
+      if (node.ejectedUntil) {
+        console.log(`[health] ${node.hostname} traffic OK — clearing circuit ejection`);
+      }
+      node.trafficFailures = 0;
+      node.ejectedUntil = 0;
+      return;
+    }
+    node.trafficFailures = (node.trafficFailures ?? 0) + 1;
+    const now = Date.now();
+    if (node.trafficFailures >= this.#trafficEjectThreshold && (node.ejectedUntil ?? 0) <= now) {
+      node.ejectedUntil = now + this.#ejectCooldownMs;
+      console.warn(`[health] ${node.hostname} (${node.url}) EJECTED for ${this.#ejectCooldownMs}ms after ${node.trafficFailures} traffic failures (circuit-break)`);
+    }
   }
 
   /**
@@ -116,6 +158,8 @@ export class HealthChecker {
         latencyMs: 0,
         avgLatencyMs: 0,
         consecutiveFailures: 0,
+        trafficFailures: 0,
+        ejectedUntil: 0,
         lastCheckedAt: null,
         lastHealthyAt: null,
       });
