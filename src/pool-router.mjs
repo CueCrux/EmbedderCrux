@@ -129,16 +129,23 @@ async function flushBatch() {
   if (pending.length === 0) return;
   const allTexts = pending.flatMap(p => p.texts);
 
-  // Pick remote node if healthy and batch is large enough, else local fallback
+  // Build a failover-ordered candidate list: preferred (remote on big batches)
+  // first, then the rest of the healthy pool. On a backend failure (5xx OR
+  // thrown) we record the outcome (circuit-breaker) and fail over to the next
+  // candidate instead of rejecting every caller — closes the 502 over-routing
+  // pathology where one flaky backend torpedoed whole coalesced batches.
   const healthy = healthChecker.getHealthyNodes();
   const remoteNode = remoteBatchNodeUrl
     ? healthy.find(n => n.url.replace(/\/+$/, '') === remoteBatchNodeUrl)
     : null;
-  const target = (remoteNode && allTexts.length >= remoteBatchMinTexts)
-    ? remoteNode
-    : healthy.find(n => !fastNodeUrls.has(n.url.replace(/\/+$/, ''))) ?? healthy[0];
+  const preferred = (remoteNode && allTexts.length >= remoteBatchMinTexts) ? remoteNode : null;
+  const ordered = [];
+  if (preferred) ordered.push(preferred);
+  for (const n of healthy) {
+    if (!preferred || n.id !== preferred.id) ordered.push(n);
+  }
 
-  if (!target) {
+  if (ordered.length === 0) {
     const err = new Error('no_healthy_backends');
     for (const p of pending) p.reject(err);
     return;
@@ -146,39 +153,51 @@ async function flushBatch() {
 
   const batchBody = Buffer.from(JSON.stringify({ inputs: allTexts }));
   const fwdHeaders = { 'content-type': 'application/json', 'content-length': String(batchBody.length) };
-  const label = (target === remoteNode) ? 'remote-coalesced' : 'local-coalesced-fallback';
+  const maxHops = Math.min(ordered.length, Number(process.env.POOL_BATCH_MAX_HOPS ?? 3));
+  const tried = [];
 
-  inflightInc(target.id);
-  const start = performance.now();
-  try {
-    const result = await proxyTo(target.url, '/embed', 'POST', fwdHeaders, batchBody);
-    const durationMs = performance.now() - start;
-    metrics.recordRequest(target.hostname, '/embed', label, durationMs);
+  for (let hop = 0; hop < maxHops; hop++) {
+    const target = ordered[hop];
+    const label = (hop === 0 && target === preferred) ? 'remote-coalesced' : 'coalesced-failover';
+    inflightInc(target.id);
+    const start = performance.now();
+    try {
+      const result = await proxyTo(target.url, '/embed', 'POST', fwdHeaders, batchBody);
+      metrics.recordRequest(target.hostname, '/embed', label, performance.now() - start);
 
-    if (result.status !== 200) {
-      const err = new Error(`backend_${result.status}`);
-      for (const p of pending) p.reject(err);
-      return;
+      if (result.status !== 200) {
+        healthChecker.recordTrafficOutcome(target.id, false);
+        tried.push(`${target.hostname}:${result.status}`);
+        continue; // fail over to the next backend
+      }
+
+      healthChecker.recordTrafficOutcome(target.id, true);
+      // Split combined response back to individual callers
+      const allVectors = JSON.parse(result.body.toString('utf8'));
+      let offset = 0;
+      for (const p of pending) {
+        const slice = allVectors.slice(offset, offset + p.texts.length);
+        const sliceBody = Buffer.from(JSON.stringify(slice));
+        p.resolve({
+          status: 200,
+          headers: { 'content-type': 'application/json', 'content-length': String(sliceBody.length) },
+          body: sliceBody,
+        });
+        offset += p.texts.length;
+      }
+      return; // success
+    } catch (err) {
+      metrics.recordRequest(target.hostname, '/embed', 'error', performance.now() - start);
+      healthChecker.recordTrafficOutcome(target.id, false);
+      tried.push(`${target.hostname}:${err.message}`);
+    } finally {
+      inflightDec(target.id);
     }
-
-    // Split combined response back to individual callers
-    const allVectors = JSON.parse(result.body.toString('utf8'));
-    let offset = 0;
-    for (const p of pending) {
-      const slice = allVectors.slice(offset, offset + p.texts.length);
-      const sliceBody = Buffer.from(JSON.stringify(slice));
-      p.resolve({
-        status: 200,
-        headers: { 'content-type': 'application/json', 'content-length': String(sliceBody.length) },
-        body: sliceBody,
-      });
-      offset += p.texts.length;
-    }
-  } catch (err) {
-    for (const p of pending) p.reject(err);
-  } finally {
-    inflightDec(target.id);
   }
+
+  // Every candidate failed — only now reject the callers, with diagnostics.
+  const err = new Error(`all_backends_failed: ${tried.join('; ')}`);
+  for (const p of pending) p.reject(err);
 }
 
 /**
@@ -484,12 +503,21 @@ async function handleProxy(req, res, route) {
     const statusBucket = `${Math.floor(result.status / 100)}xx`;
     metrics.recordRequest(node.hostname, route, statusBucket, durationMs);
 
-    res.writeHead(result.status, result.headers);
-    res.end(result.body);
-    return;
+    // A 5xx STATUS is a backend failure too (not just a thrown error) — the
+    // flaky-5090 returned 502 *responses*. Record it for the circuit-breaker
+    // and fall through to retry on a different node.
+    if (result.status < 500) {
+      healthChecker.recordTrafficOutcome(node.id, true);
+      res.writeHead(result.status, result.headers);
+      res.end(result.body);
+      return;
+    }
+    healthChecker.recordTrafficOutcome(node.id, false);
+    console.warn(`[proxy] ${node.hostname} returned ${result.status} for ${route} — attempting retry`);
   } catch (err) {
     const durationMs = performance.now() - start;
     metrics.recordRequest(node.hostname, route, 'error', durationMs);
+    healthChecker.recordTrafficOutcome(node.id, false);
     console.warn(`[proxy] ${node.hostname} failed for ${route}: ${err.message} — attempting retry`);
   } finally {
     inflightDec(node.id);
@@ -512,16 +540,151 @@ async function handleProxy(req, res, route) {
     const statusBucket = `${Math.floor(result.status / 100)}xx`;
     metrics.recordRequest(retryNode.hostname, route, statusBucket, durationMs);
     metrics.recordRequest(retryNode.hostname, route, 'retry', 0); // tag this was a retry
+    healthChecker.recordTrafficOutcome(retryNode.id, result.status < 500);
 
     res.writeHead(result.status, result.headers);
     res.end(result.body);
   } catch (retryErr) {
     const durationMs = performance.now() - retryStart;
     metrics.recordRequest(retryNode.hostname, route, 'error', durationMs);
+    healthChecker.recordTrafficOutcome(retryNode.id, false);
     sendJson(res, 502, { error: 'all_backends_failed', tried: [node.hostname, retryNode.hostname] });
   } finally {
     inflightDec(retryNode.id);
   }
+}
+
+// ── Bundle distribution (M4) ──────────────────────────────────────────
+
+/**
+ * Embed one shard of texts against the healthy pool with circuit-breaker
+ * failover. Tries `preferredNode` first (when still healthy), then the rest of
+ * the pool by latency. Returns the parsed vectors array (length === texts
+ * length) or throws after exhausting hops. Mirrors `flushBatch`'s failover
+ * loop — a 5xx response is a failure (records the outcome + fails over), so a
+ * flaky backend never torpedoes a shard that another backend could serve.
+ *
+ * @param {string[]} texts
+ * @param {{id:string,url:string,hostname:string}|null} preferredNode
+ * @returns {Promise<Array>}
+ */
+async function embedShardWithFailover(texts, preferredNode) {
+  const healthy = healthChecker.getHealthyNodes();
+  const ordered = [];
+  if (preferredNode && healthy.some(n => n.id === preferredNode.id)) {
+    ordered.push(healthy.find(n => n.id === preferredNode.id));
+  }
+  for (const n of healthy) {
+    if (!ordered.some(o => o.id === n.id)) ordered.push(n);
+  }
+  if (ordered.length === 0) throw new Error('no_healthy_backends');
+
+  const body = Buffer.from(JSON.stringify({ inputs: texts }));
+  const fwdHeaders = { 'content-type': 'application/json', 'content-length': String(body.length) };
+  const maxHops = Math.min(ordered.length, Number(process.env.POOL_BATCH_MAX_HOPS ?? 3));
+  const tried = [];
+
+  for (let hop = 0; hop < maxHops; hop++) {
+    const target = ordered[hop];
+    inflightInc(target.id);
+    const start = performance.now();
+    try {
+      const result = await proxyTo(target.url, '/embed', 'POST', fwdHeaders, body);
+      metrics.recordRequest(target.hostname, '/embed', 'bundle-shard', performance.now() - start);
+      if (result.status !== 200) {
+        healthChecker.recordTrafficOutcome(target.id, false);
+        tried.push(`${target.hostname}:${result.status}`);
+        continue; // fail over to the next backend
+      }
+      healthChecker.recordTrafficOutcome(target.id, true);
+      return JSON.parse(result.body.toString('utf8'));
+    } catch (err) {
+      metrics.recordRequest(target.hostname, '/embed', 'error', performance.now() - start);
+      healthChecker.recordTrafficOutcome(target.id, false);
+      tried.push(`${target.hostname}:${err.message}`);
+    } finally {
+      inflightDec(target.id);
+    }
+  }
+  throw new Error(`all_backends_failed: ${tried.join('; ')}`);
+}
+
+/**
+ * POST /embed/bundle — accept one large `{inputs:[...]}` bundle, SPLIT it
+ * across the healthy backends proportional to capacity (latency-EMA: a faster
+ * backend gets a larger shard; equal split until latency is measured), embed
+ * each shard in PARALLEL with per-shard failover, and REASSEMBLE the vectors in
+ * original input order. The pool owns distribution + retries + ordering, so the
+ * builder submits one bundle instead of N sequential sub-batch posts.
+ *
+ * Response shape matches `/embed`: a single JSON array of vectors, one per
+ * input, in order.
+ */
+async function handleEmbedBundle(req, res) {
+  let body;
+  try {
+    body = await readBody(req);
+  } catch {
+    sendJson(res, 413, { error: 'request_body_too_large' });
+    return;
+  }
+  let inputs;
+  try {
+    const parsed = JSON.parse(body.toString('utf8'));
+    if (Array.isArray(parsed?.inputs)) inputs = parsed.inputs.filter(t => typeof t === 'string');
+  } catch {
+    sendJson(res, 400, { error: 'invalid_json' });
+    return;
+  }
+  if (!inputs || inputs.length === 0) {
+    sendJson(res, 400, { error: 'empty_inputs' });
+    return;
+  }
+
+  const healthy = healthChecker.getHealthyNodes();
+  if (healthy.length === 0) {
+    sendJson(res, 503, { error: 'no_healthy_backends', pool_size: discovery.getTargets().length });
+    return;
+  }
+
+  // Capacity-proportional shard sizes. Weight by inverse latency-EMA (faster →
+  // bigger shard); avgLatencyMs===0 (unmeasured) yields equal weights. The last
+  // shard absorbs any rounding remainder so every input is always covered.
+  const weights = healthy.map(n => 1 / ((n.avgLatencyMs ?? 0) + 1));
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+  const shards = [];
+  let cursor = 0;
+  for (let i = 0; i < healthy.length && cursor < inputs.length; i++) {
+    const isLast = i === healthy.length - 1;
+    const want = Math.round((inputs.length * weights[i]) / totalWeight);
+    const end = isLast ? inputs.length : Math.min(inputs.length, cursor + Math.max(0, want));
+    if (end > cursor) {
+      shards.push({ node: healthy[i], start: cursor, end });
+      cursor = end;
+    }
+  }
+  // Rounding can leave a tail if no shard was marked last (all earlier shards
+  // under-filled and we ran out of nodes): give the remainder to the fastest.
+  if (cursor < inputs.length) {
+    if (shards.length === 0) shards.push({ node: healthy[0], start: cursor, end: inputs.length });
+    else shards[shards.length - 1].end = inputs.length;
+  }
+
+  const out = new Array(inputs.length);
+  try {
+    await Promise.all(shards.map(async (sh) => {
+      const vecs = await embedShardWithFailover(inputs.slice(sh.start, sh.end), sh.node);
+      const want = sh.end - sh.start;
+      if (!Array.isArray(vecs) || vecs.length !== want) {
+        throw new Error(`shard length mismatch: got ${vecs?.length} want ${want}`);
+      }
+      for (let j = 0; j < vecs.length; j++) out[sh.start + j] = vecs[j];
+    }));
+  } catch (err) {
+    sendJson(res, 502, { error: 'bundle_failed', message: err.message });
+    return;
+  }
+  sendJson(res, 200, out);
 }
 
 // ── HTTP Server ───────────────────────────────────────────────────────
@@ -657,6 +820,12 @@ const server = http.createServer(async (req, res) => {
 
   if (path === '/embed/sequence' && req.method === 'POST') {
     await handleProxy(req, res, '/embed/sequence');
+    return;
+  }
+
+  // M4 — bundle distribution: split one large bundle across backends.
+  if (path === '/embed/bundle' && req.method === 'POST') {
+    await handleEmbedBundle(req, res);
     return;
   }
 
