@@ -554,6 +554,139 @@ async function handleProxy(req, res, route) {
   }
 }
 
+// ── Bundle distribution (M4) ──────────────────────────────────────────
+
+/**
+ * Embed one shard of texts against the healthy pool with circuit-breaker
+ * failover. Tries `preferredNode` first (when still healthy), then the rest of
+ * the pool by latency. Returns the parsed vectors array (length === texts
+ * length) or throws after exhausting hops. Mirrors `flushBatch`'s failover
+ * loop — a 5xx response is a failure (records the outcome + fails over), so a
+ * flaky backend never torpedoes a shard that another backend could serve.
+ *
+ * @param {string[]} texts
+ * @param {{id:string,url:string,hostname:string}|null} preferredNode
+ * @returns {Promise<Array>}
+ */
+async function embedShardWithFailover(texts, preferredNode) {
+  const healthy = healthChecker.getHealthyNodes();
+  const ordered = [];
+  if (preferredNode && healthy.some(n => n.id === preferredNode.id)) {
+    ordered.push(healthy.find(n => n.id === preferredNode.id));
+  }
+  for (const n of healthy) {
+    if (!ordered.some(o => o.id === n.id)) ordered.push(n);
+  }
+  if (ordered.length === 0) throw new Error('no_healthy_backends');
+
+  const body = Buffer.from(JSON.stringify({ inputs: texts }));
+  const fwdHeaders = { 'content-type': 'application/json', 'content-length': String(body.length) };
+  const maxHops = Math.min(ordered.length, Number(process.env.POOL_BATCH_MAX_HOPS ?? 3));
+  const tried = [];
+
+  for (let hop = 0; hop < maxHops; hop++) {
+    const target = ordered[hop];
+    inflightInc(target.id);
+    const start = performance.now();
+    try {
+      const result = await proxyTo(target.url, '/embed', 'POST', fwdHeaders, body);
+      metrics.recordRequest(target.hostname, '/embed', 'bundle-shard', performance.now() - start);
+      if (result.status !== 200) {
+        healthChecker.recordTrafficOutcome(target.id, false);
+        tried.push(`${target.hostname}:${result.status}`);
+        continue; // fail over to the next backend
+      }
+      healthChecker.recordTrafficOutcome(target.id, true);
+      return JSON.parse(result.body.toString('utf8'));
+    } catch (err) {
+      metrics.recordRequest(target.hostname, '/embed', 'error', performance.now() - start);
+      healthChecker.recordTrafficOutcome(target.id, false);
+      tried.push(`${target.hostname}:${err.message}`);
+    } finally {
+      inflightDec(target.id);
+    }
+  }
+  throw new Error(`all_backends_failed: ${tried.join('; ')}`);
+}
+
+/**
+ * POST /embed/bundle — accept one large `{inputs:[...]}` bundle, SPLIT it
+ * across the healthy backends proportional to capacity (latency-EMA: a faster
+ * backend gets a larger shard; equal split until latency is measured), embed
+ * each shard in PARALLEL with per-shard failover, and REASSEMBLE the vectors in
+ * original input order. The pool owns distribution + retries + ordering, so the
+ * builder submits one bundle instead of N sequential sub-batch posts.
+ *
+ * Response shape matches `/embed`: a single JSON array of vectors, one per
+ * input, in order.
+ */
+async function handleEmbedBundle(req, res) {
+  let body;
+  try {
+    body = await readBody(req);
+  } catch {
+    sendJson(res, 413, { error: 'request_body_too_large' });
+    return;
+  }
+  let inputs;
+  try {
+    const parsed = JSON.parse(body.toString('utf8'));
+    if (Array.isArray(parsed?.inputs)) inputs = parsed.inputs.filter(t => typeof t === 'string');
+  } catch {
+    sendJson(res, 400, { error: 'invalid_json' });
+    return;
+  }
+  if (!inputs || inputs.length === 0) {
+    sendJson(res, 400, { error: 'empty_inputs' });
+    return;
+  }
+
+  const healthy = healthChecker.getHealthyNodes();
+  if (healthy.length === 0) {
+    sendJson(res, 503, { error: 'no_healthy_backends', pool_size: discovery.getTargets().length });
+    return;
+  }
+
+  // Capacity-proportional shard sizes. Weight by inverse latency-EMA (faster →
+  // bigger shard); avgLatencyMs===0 (unmeasured) yields equal weights. The last
+  // shard absorbs any rounding remainder so every input is always covered.
+  const weights = healthy.map(n => 1 / ((n.avgLatencyMs ?? 0) + 1));
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+  const shards = [];
+  let cursor = 0;
+  for (let i = 0; i < healthy.length && cursor < inputs.length; i++) {
+    const isLast = i === healthy.length - 1;
+    const want = Math.round((inputs.length * weights[i]) / totalWeight);
+    const end = isLast ? inputs.length : Math.min(inputs.length, cursor + Math.max(0, want));
+    if (end > cursor) {
+      shards.push({ node: healthy[i], start: cursor, end });
+      cursor = end;
+    }
+  }
+  // Rounding can leave a tail if no shard was marked last (all earlier shards
+  // under-filled and we ran out of nodes): give the remainder to the fastest.
+  if (cursor < inputs.length) {
+    if (shards.length === 0) shards.push({ node: healthy[0], start: cursor, end: inputs.length });
+    else shards[shards.length - 1].end = inputs.length;
+  }
+
+  const out = new Array(inputs.length);
+  try {
+    await Promise.all(shards.map(async (sh) => {
+      const vecs = await embedShardWithFailover(inputs.slice(sh.start, sh.end), sh.node);
+      const want = sh.end - sh.start;
+      if (!Array.isArray(vecs) || vecs.length !== want) {
+        throw new Error(`shard length mismatch: got ${vecs?.length} want ${want}`);
+      }
+      for (let j = 0; j < vecs.length; j++) out[sh.start + j] = vecs[j];
+    }));
+  } catch (err) {
+    sendJson(res, 502, { error: 'bundle_failed', message: err.message });
+    return;
+  }
+  sendJson(res, 200, out);
+}
+
 // ── HTTP Server ───────────────────────────────────────────────────────
 
 function sendJson(res, status, data) {
@@ -687,6 +820,12 @@ const server = http.createServer(async (req, res) => {
 
   if (path === '/embed/sequence' && req.method === 'POST') {
     await handleProxy(req, res, '/embed/sequence');
+    return;
+  }
+
+  // M4 — bundle distribution: split one large bundle across backends.
+  if (path === '/embed/bundle' && req.method === 'POST') {
+    await handleEmbedBundle(req, res);
     return;
   }
 
