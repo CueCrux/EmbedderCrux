@@ -1,0 +1,23 @@
+# Local override for this host: drivew-host (Tailscale 100.86.18.10).
+#
+# The committed docker-compose.bge.yml is correct for the RTX 5090 box and
+# pins the Blackwell SM120 image (ghcr.io/.../text-embeddings-inference:120-1.9).
+# This host is an RTX A5000 Laptop GPU (16 GB, Ampere SM86), so the 120 image
+# will NOT load. This override swaps in the Ampere 8.6 build (86-1.9) per the
+# README "Choosing Your TEI Image" table.
+#
+# Bring up ONLY the dense backend (joins the production dense vector embedding
+# pool on cuecrux-data-1 / corecrux-gpu-1 as backend http://100.86.18.10:8089):
+#
+#   docker compose \
+#     -f docker-compose.bge.yml \
+#     -f docker-compose.bge.a5000.yml \
+#     up -d bgem3-dense
+#
+# Tear down:
+#   docker compose -f docker-compose.bge.yml -f docker-compose.bge.a5000.yml down
+
+services:
+  bgem3-dense:
+    # Ampere SM86 (A5000) build — overrides the 120-1.9 anchor from the base file.
+    image: ghcr.io/huggingface/text-embeddings-inference:86-1.9
