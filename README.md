@@ -80,7 +80,7 @@ Hosted embedding APIs are convenient, but they bill per token and can deprecate 
 | --- | --- | --- |
 | `TS_HOSTNAME` | Hostname shown for this node in Tailscale | `embedder` |
 | `TS_TAG` | ACL tag name used for `--advertise-tags=tag:<value>` | `embedder` |
-| `VAULT_ADDR` | Vault API address used by launcher script | `https://100.76.91.69:8200` |
+| `VAULT_ADDR` | Vault API address used by launcher script | `http://100.74.157.35:8200` |
 | `VAULT_SKIP_VERIFY` | Set `true` to skip TLS verification when using self-signed certs | `true` |
 | `VAULT_TOKEN_FILE` | File containing Vault token (used when `VAULT_TOKEN` is unset) | `${HOME}/.vault-token` |
 | `VAULT_SECRET_PATH` | KVv2 path containing `ts_client_id` and `ts_client_secret` | `kv/app/embeddercrux/prod` |
